@@ -56,8 +56,6 @@ async def start(message: Message):
 
 @dp.callback_query(F.data == "buy")
 async def buy(callback):
-    print("🟡 BUY CLICKED")
-
     prices = [LabeledPrice(label="Доступ ко всем медитациям", amount=19900)]
 
     await bot.send_invoice(
@@ -76,7 +74,6 @@ async def buy(callback):
 
 @dp.pre_checkout_query()
 async def pre_checkout(pre_checkout_q: PreCheckoutQuery):
-    print("🧾 PRE CHECKOUT RECEIVED")
     await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
 
 
@@ -99,7 +96,14 @@ async def successful_payment(message: Message):
 
 async def check_paid(request):
     user_id = request.query.get("user_id")
+
+    if not user_id:
+        return web.json_response({"paid": False})
+
+    user_id = str(user_id).strip()
+
     users = load_users()
+
     return web.json_response({"paid": user_id in users})
 
 
