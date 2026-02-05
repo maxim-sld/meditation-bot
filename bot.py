@@ -3,11 +3,17 @@ import json
 import os
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, LabeledPrice
+from aiogram.types import (
+    Message,
+    LabeledPrice,
+    PreCheckoutQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 from aiogram.filters import CommandStart
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PAY_TOKEN = os.getenv("PAY_TOKEN")  # ЮKassa TEST
+PAY_TOKEN = os.getenv("PAY_TOKEN")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
@@ -33,21 +39,25 @@ def save_users(data):
 
 @dp.message(CommandStart())
 async def start(message: Message):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Купить полный доступ", callback_data="buy")]
+        ]
+    )
+
     await message.answer(
         "Добро пожаловать ✨\n\n"
         "Чтобы открыть все медитации — нажмите кнопку ниже 👇",
-        reply_markup={
-            "inline_keyboard": [
-                [{"text": "💳 Купить полный доступ", "callback_data": "buy"}]
-            ]
-        },
+        reply_markup=kb,
     )
 
 
-# ================= BUY BUTTON =================
+# ================= BUY =================
 
 @dp.callback_query(F.data == "buy")
 async def buy(callback):
+    print("🟡 BUY CLICKED")
+
     prices = [LabeledPrice(label="Доступ ко всем медитациям", amount=19900)]
 
     await bot.send_invoice(
@@ -62,10 +72,20 @@ async def buy(callback):
     )
 
 
-# ================= SUCCESSFUL PAYMENT =================
+# ================= PRE CHECKOUT =================
+
+@dp.pre_checkout_query()
+async def pre_checkout(pre_checkout_q: PreCheckoutQuery):
+    print("🧾 PRE CHECKOUT RECEIVED")
+    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+
+
+# ================= SUCCESS =================
 
 @dp.message(F.successful_payment)
 async def successful_payment(message: Message):
+    print("🔥 SUCCESSFUL PAYMENT EVENT")
+
     user_id = str(message.from_user.id)
 
     users = load_users()
@@ -75,12 +95,11 @@ async def successful_payment(message: Message):
     await message.answer("Оплата прошла успешно! 🎉\n\nВсе медитации открыты.")
 
 
-# ================= API /check =================
+# ================= API =================
 
 async def check_paid(request):
     user_id = request.query.get("user_id")
     users = load_users()
-
     return web.json_response({"paid": user_id in users})
 
 
