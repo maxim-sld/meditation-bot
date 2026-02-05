@@ -98,7 +98,7 @@ async def start_web_server():
 
 
 async def main():
-    await start_web()
+    await start_web_server()
     await dp.start_polling(bot)
 
 
