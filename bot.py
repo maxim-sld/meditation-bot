@@ -1,108 +1,107 @@
-import json
-import logging
-from aiogram import Bot, Dispatcher, types
-from aiogram.types import LabeledPrice
-from aiogram.filters import CommandStart
-from aiogram import F
-from aiogram.utils.keyboard import InlineKeyboardBuilder
-from aiogram.enums import ContentType
 import asyncio
+import json
+import os
+from aiohttp import web
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, LabeledPrice
+from aiogram.filters import CommandStart
 
-BOT_TOKEN = "8361965118:AAGs96ijjC7og3_-uHr5B0rzaa1Mcx52V5Q"
-PROVIDER_TOKEN = "381764678:TEST:164912"  # тестовый ЮKassa
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PAY_TOKEN = os.getenv("PAY_TOKEN")  # ЮKassa TEST
 
-logging.basicConfig(level=logging.INFO)
-
-bot = Bot(token=BOT_TOKEN)
+bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-DB_FILE = "users.json"
+USERS_FILE = "users.json"
 
+
+# ================= USERS =================
 
 def load_users():
-    try:
-        with open(DB_FILE, "r") as f:
-            return json.load(f)
-    except:
+    if not os.path.exists(USERS_FILE):
         return {}
+    with open(USERS_FILE, "r") as f:
+        return json.load(f)
 
 
 def save_users(data):
-    with open(DB_FILE, "w") as f:
+    with open(USERS_FILE, "w") as f:
         json.dump(data, f)
 
 
-@dp.message(CommandStart())
-async def start(message: types.Message):
-    kb = InlineKeyboardBuilder()
-    kb.button(text="💳 Купить доступ", callback_data="buy")
+# ================= START =================
 
+@dp.message(CommandStart())
+async def start(message: Message):
     await message.answer(
-        "Добро пожаловать в медитации 🧘\n\n"
-        "Полный доступ ко всем медитациям — **199 ₽**",
-        reply_markup=kb.as_markup(),
-        parse_mode="Markdown",
+        "Добро пожаловать ✨\n\n"
+        "Чтобы открыть все медитации — нажмите кнопку ниже 👇",
+        reply_markup={
+            "inline_keyboard": [
+                [{"text": "💳 Купить полный доступ", "callback_data": "buy"}]
+            ]
+        },
     )
 
 
+# ================= BUY BUTTON =================
+
 @dp.callback_query(F.data == "buy")
-async def buy(callback: types.CallbackQuery):
-    prices = [LabeledPrice(label="Доступ к медитациям", amount=19900)]
+async def buy(callback):
+    prices = [LabeledPrice(label="Доступ ко всем медитациям", amount=19900)]
 
     await bot.send_invoice(
         chat_id=callback.from_user.id,
-        title="Доступ к медитациям",
-        description="Полный доступ ко всем медитациям",
-        provider_token=PROVIDER_TOKEN,
+        title="Полный доступ к медитациям",
+        description="Разблокирует все медитации навсегда",
+        payload="meditation_access",
+        provider_token=PAY_TOKEN,
         currency="RUB",
         prices=prices,
-        payload="meditation_access",
+        start_parameter="buy_access",
     )
 
 
-@dp.pre_checkout_query()
-async def pre_checkout(pre_checkout_q: types.PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+# ================= SUCCESSFUL PAYMENT =================
 
+@dp.message(F.successful_payment)
+async def successful_payment(message: Message):
+    user_id = str(message.from_user.id)
 
-@dp.message(F.content_type == ContentType.SUCCESSFUL_PAYMENT)
-async def successful_payment(message: types.Message):
     users = load_users()
-    users[str(message.from_user.id)] = {"paid": True}
+    users[user_id] = {"paid": True}
     save_users(users)
 
-    await message.answer(
-        "✅ Оплата прошла успешно!\n"
-        "Теперь у тебя есть доступ ко всем медитациям."
-    )
+    await message.answer("Оплата прошла успешно! 🎉\n\nВсе медитации открыты.")
 
-from aiohttp import web
+
+# ================= API /check =================
 
 async def check_paid(request):
     user_id = request.query.get("user_id")
     users = load_users()
 
-    if user_id in users and users[user_id].get("paid"):
-        return web.json_response({"paid": True})
-    return web.json_response({"paid": False})
+    return web.json_response({"paid": user_id in users})
 
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/check", check_paid)
 
+    port = int(os.environ.get("PORT", 8080))
+
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", 8080)
+    site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
+
+# ================= MAIN =================
 
 async def main():
     await start_web_server()
     await dp.start_polling(bot)
 
 
-
 if __name__ == "__main__":
     asyncio.run(main())
-
