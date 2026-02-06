@@ -1,3 +1,4 @@
+python
 import asyncio
 import os
 import asyncpg
@@ -20,11 +21,43 @@ dp = Dispatcher()
 db: asyncpg.Pool
 
 
-# ================= DB =================
+# ================= DB INIT =================
 
 async def init_db():
     global db
     db = await asyncpg.create_pool(DATABASE_URL)
+
+    async with db.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS meditations (
+            id BIGSERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT,
+            audio_url TEXT,
+            duration_sec INT,
+            is_free BOOLEAN DEFAULT FALSE
+        );
+
+        CREATE TABLE IF NOT EXISTS subscription_plans (
+            id BIGSERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            price INT NOT NULL,
+            duration_days INT NOT NULL,
+            is_active BOOLEAN DEFAULT TRUE
+        );
+
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT REFERENCES users(id),
+            plan_id BIGINT REFERENCES subscription_plans(id),
+            expires_at TIMESTAMP
+        );
+        """)
 
 
 # ================= USERS =================
@@ -70,10 +103,7 @@ async def give_subscription(user_id: int, plan_id: int):
 async def has_active_subscription(user_id: int) -> bool:
     async with db.acquire() as conn:
         row = await conn.fetchval(
-            """
-            SELECT 1 FROM subscriptions
-            WHERE user_id=$1 AND expires_at > NOW()
-            """,
+            "SELECT 1 FROM subscriptions WHERE user_id=$1 AND expires_at > NOW()",
             user_id,
         )
         return bool(row)
@@ -84,38 +114,29 @@ async def has_active_subscription(user_id: int) -> bool:
 @dp.message(CommandStart())
 async def start(message: Message):
     await get_or_create_user(message.from_user.id)
-
-    await message.answer(
-        "Добро пожаловать ✨\n\n"
-        "Открой Mini App и выбери медитацию."
-    )
+    await message.answer("Открой Mini App и выбери медитацию ✨")
 
 
-# ---------- BUY HANDLERS ----------
+# ---------- BUY ----------
 
-@dp.message(F.text == "💳 Подписка 1 месяц")
-async def buy_1m(message: Message):
+@dp.message(F.text.startswith("💳 Купить"))
+async def buy_plan(message: Message):
+    plan_id = int(message.text.split("#")[1])
+
+    async with db.acquire() as conn:
+        plan = await conn.fetchrow(
+            "SELECT title, price FROM subscription_plans WHERE id=$1",
+            plan_id,
+        )
+
     await bot.send_invoice(
         chat_id=message.from_user.id,
-        title="Подписка на 1 месяц",
-        description="Доступ ко всем медитациям на 30 дней",
-        payload="sub_1",
+        title=plan["title"],
+        description="Подписка на медитации",
+        payload=f"plan_{plan_id}",
         provider_token=PAY_TOKEN,
         currency="RUB",
-        prices=[LabeledPrice(label="1 месяц", amount=19900)],
-    )
-
-
-@dp.message(F.text == "💳 Подписка 3 месяца")
-async def buy_3m(message: Message):
-    await bot.send_invoice(
-        chat_id=message.from_user.id,
-        title="Подписка на 3 месяца",
-        description="Доступ ко всем медитациям на 90 дней",
-        payload="sub_3",
-        provider_token=PAY_TOKEN,
-        currency="RUB",
-        prices=[LabeledPrice(label="3 месяца", amount=49900)],
+        prices=[LabeledPrice(label=plan["title"], amount=plan["price"])],
     )
 
 
@@ -129,25 +150,18 @@ async def successful_payment(message: Message):
     user_id = await get_or_create_user(message.from_user.id)
 
     payload = message.successful_payment.invoice_payload
+    plan_id = int(payload.split("_")[1])
 
-    if payload == "sub_1":
-        await give_subscription(user_id, 1)
+    await give_subscription(user_id, plan_id)
 
-    elif payload == "sub_3":
-        await give_subscription(user_id, 2)
-
-    await message.answer("Оплата прошла успешно 🎉\nПодписка активирована.")
+    await message.answer("Подписка активирована 🎉")
 
 
 # ================= PUBLIC API =================
 
 async def api_meditations(request):
     rows = await db.fetch(
-        """
-        SELECT id, title, description, audio_url, duration_sec, is_free
-        FROM meditations
-        ORDER BY id
-        """
+        "SELECT id, title, description, audio_url, duration_sec, is_free FROM meditations"
     )
     return web.json_response([dict(r) for r in rows])
 
@@ -167,20 +181,45 @@ async def api_access(request):
     if free:
         return web.json_response({"access": True})
 
-    access = await has_active_subscription(user_id)
-    return web.json_response({"access": access})
+    return web.json_response({"access": await has_active_subscription(user_id)})
 
 
 async def api_plans(request):
     rows = await db.fetch(
-        """
-        SELECT id, title, price, duration_days
-        FROM subscription_plans
-        WHERE is_active = TRUE
-        ORDER BY price
-        """
+        "SELECT id, title, price, duration_days FROM subscription_plans WHERE is_active=TRUE"
     )
     return web.json_response([dict(r) for r in rows])
+
+
+# ================= ADMIN =================
+
+async def api_admin_all_plans(request):
+    rows = await db.fetch("SELECT * FROM subscription_plans ORDER BY id")
+    return web.json_response([dict(r) for r in rows])
+
+
+async def api_admin_create_plan(request):
+    data = await request.json()
+
+    await db.execute(
+        "INSERT INTO subscription_plans (title, price, duration_days) VALUES ($1,$2,$3)",
+        data["title"],
+        int(data["price"]),
+        int(data["duration_days"]),
+    )
+
+    return web.json_response({"ok": True})
+
+
+async def api_admin_toggle_plan(request):
+    plan_id = int(request.match_info["id"])
+
+    await db.execute(
+        "UPDATE subscription_plans SET is_active = NOT is_active WHERE id=$1",
+        plan_id,
+    )
+
+    return web.json_response({"ok": True})
 
 
 # ================= WEB =================
@@ -201,11 +240,10 @@ async def start_web():
     app.router.add_get("/meditations", api_meditations)
     app.router.add_get("/access", api_access)
     app.router.add_get("/plans", api_plans)
+
     app.router.add_get("/admin/plans", api_admin_all_plans)
     app.router.add_post("/admin/plans", api_admin_create_plan)
     app.router.add_post("/admin/plans/{id}/toggle", api_admin_toggle_plan)
-
-    app.router.add_get("/admin/subscriptions", api_admin_subscriptions)
 
     for route in list(app.router.routes()):
         cors.add(route)
@@ -227,67 +265,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-# ================= ADMIN: PLANS =================
-
-async def api_admin_all_plans(request):
-    rows = await db.fetch(
-        "SELECT id, title, price, duration_days, is_active FROM subscription_plans ORDER BY id"
-    )
-    return web.json_response([dict(r) for r in rows])
-
-
-async def api_admin_create_plan(request):
-    data = await request.json()
-
-    await db.execute(
-        """
-        INSERT INTO subscription_plans (title, price, duration_days, is_active)
-        VALUES ($1,$2,$3,TRUE)
-        """,
-        data["title"],
-        int(data["price"]),
-        int(data["duration_days"]),
-    )
-
-    return web.json_response({"ok": True})
-
-
-async def api_admin_toggle_plan(request):
-    plan_id = int(request.match_info["id"])
-
-    await db.execute(
-        """
-        UPDATE subscription_plans
-        SET is_active = NOT is_active
-        WHERE id=$1
-        """,
-        plan_id,
-    )
-
-    return web.json_response({"ok": True})
-
-
-# ================= ADMIN: SUBSCRIPTIONS =================
-
-async def api_admin_subscriptions(request):
-    rows = await db.fetch(
-        """
-        SELECT
-            u.telegram_id,
-            p.title AS plan,
-            s.expires_at
-        FROM subscriptions s
-        JOIN users u ON u.id = s.user_id
-        JOIN subscription_plans p ON p.id = s.plan_id
-        ORDER BY s.expires_at DESC
-        LIMIT 100
-        """
-    )
-
-    result = []
-    for r in rows:
-        item = dict(r)
-        item["expires_at"] = item["expires_at"].isoformat()
-        result.append(item)
-
-    return web.json_response(result)
