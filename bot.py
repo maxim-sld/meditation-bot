@@ -30,10 +30,23 @@ async def init_db():
     db = await asyncpg.create_pool(DATABASE_URL)
 
     async with db.acquire() as conn:
+        # таблица пользователей
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 telegram_id BIGINT PRIMARY KEY,
                 paid BOOLEAN DEFAULT FALSE
+            )
+        """)
+
+        # таблица логов оплат
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS payments (
+                id SERIAL PRIMARY KEY,
+                telegram_id BIGINT NOT NULL,
+                payload TEXT,
+                amount INTEGER,
+                currency TEXT,
+                created_at TIMESTAMP DEFAULT NOW()
             )
         """)
 
@@ -46,6 +59,14 @@ async def set_paid(user_id: int):
             ON CONFLICT (telegram_id)
             DO UPDATE SET paid = TRUE
         """, user_id)
+
+
+async def log_payment(user_id: int, payload: str, amount: int, currency: str):
+    async with db.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO payments (telegram_id, payload, amount, currency)
+            VALUES ($1, $2, $3, $4)
+        """, user_id, payload, amount, currency)
 
 
 async def is_paid(user_id: int) -> bool:
@@ -103,9 +124,19 @@ async def pre_checkout(pre_checkout_q: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def successful_payment(message: Message):
+    payment = message.successful_payment
     user_id = message.from_user.id
 
+    # выдаём доступ
     await set_paid(user_id)
+
+    # логируем оплату
+    await log_payment(
+        user_id=user_id,
+        payload=payment.invoice_payload,
+        amount=payment.total_amount,
+        currency=payment.currency,
+    )
 
     await message.answer(
         "Оплата прошла успешно! 🎉\n\n"
@@ -125,6 +156,8 @@ async def check_paid(request):
 
     return web.json_response({"paid": paid})
 
+
+# ================= WEB SERVER =================
 
 async def start_web_server():
     app = web.Application()
