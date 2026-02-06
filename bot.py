@@ -1,15 +1,13 @@
 import asyncio
 import os
 import asyncpg
-import boto3
-import uuid
+from datetime import datetime, timedelta
 
-from mutagen.mp3 import MP3
 from aiohttp import web
 import aiohttp_cors
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, PreCheckoutQuery
+from aiogram.types import Message, PreCheckoutQuery, LabeledPrice
 from aiogram.filters import CommandStart
 
 
@@ -22,94 +20,11 @@ dp = Dispatcher()
 db: asyncpg.Pool
 
 
-# ================= YANDEX STORAGE =================
-
-s3 = boto3.client(
-    "s3",
-    endpoint_url=os.getenv("YANDEX_ENDPOINT"),
-    aws_access_key_id=os.getenv("YANDEX_ACCESS_KEY"),
-    aws_secret_access_key=os.getenv("YANDEX_SECRET_KEY"),
-)
-
-
-def upload_audio(file_path: str):
-    bucket = os.getenv("YANDEX_BUCKET")
-
-    filename = f"{uuid.uuid4()}.mp3"
-
-    audio = MP3(file_path)
-    duration = int(audio.info.length)
-
-    s3.upload_file(
-        file_path,
-        bucket,
-        filename,
-        ExtraArgs={"ContentType": "audio/mpeg"},
-    )
-
-    url = f"https://storage.yandexcloud.net/{bucket}/{filename}"
-
-    return url, duration
-
-
-# ================= DB INIT =================
+# ================= DB =================
 
 async def init_db():
     global db
     db = await asyncpg.create_pool(DATABASE_URL)
-
-    async with db.acquire() as conn:
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id BIGSERIAL PRIMARY KEY,
-            telegram_id BIGINT UNIQUE NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS packages (
-            id BIGSERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            description TEXT,
-            price INT NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS meditations (
-            id BIGSERIAL PRIMARY KEY,
-            package_id BIGINT REFERENCES packages(id) ON DELETE CASCADE,
-            title TEXT NOT NULL,
-            description TEXT,
-            audio_url TEXT NOT NULL,
-            duration_sec INT,
-            is_free BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS purchases (
-            id BIGSERIAL PRIMARY KEY,
-            user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-            package_id BIGINT REFERENCES packages(id) ON DELETE CASCADE,
-            created_at TIMESTAMP DEFAULT NOW(),
-            UNIQUE(user_id, package_id)
-        );
-
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id BIGSERIAL PRIMARY KEY,
-            user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-            plan TEXT NOT NULL,
-            expires_at TIMESTAMP NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS listens (
-            id BIGSERIAL PRIMARY KEY,
-            user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
-            meditation_id BIGINT REFERENCES meditations(id) ON DELETE CASCADE,
-            seconds_listened INT,
-            completed BOOLEAN,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-        """)
 
 
 # ================= USERS =================
@@ -129,54 +44,39 @@ async def get_or_create_user(telegram_id: int) -> int:
         return row["id"]
 
 
-# ================= ACCESS =================
+# ================= SUBSCRIPTIONS =================
 
-async def give_lifetime_access(user_id: int):
+async def give_subscription(user_id: int, plan_id: int):
     async with db.acquire() as conn:
+
+        plan = await conn.fetchrow(
+            "SELECT duration_days FROM subscription_plans WHERE id=$1",
+            plan_id,
+        )
+
+        expires = datetime.utcnow() + timedelta(days=plan["duration_days"])
+
         await conn.execute(
             """
-            INSERT INTO subscriptions (user_id, plan, expires_at)
-            VALUES ($1, 'lifetime', '2100-01-01')
+            INSERT INTO subscriptions (user_id, plan_id, expires_at)
+            VALUES ($1,$2,$3)
             """,
             user_id,
+            plan_id,
+            expires,
         )
 
 
-async def has_access(user_id: int, meditation_id: int) -> bool:
+async def has_active_subscription(user_id: int) -> bool:
     async with db.acquire() as conn:
-
-        free = await conn.fetchval(
-            "SELECT is_free FROM meditations WHERE id=$1",
-            meditation_id,
-        )
-        if free:
-            return True
-
-        sub = await conn.fetchval(
+        row = await conn.fetchval(
             """
             SELECT 1 FROM subscriptions
             WHERE user_id=$1 AND expires_at > NOW()
             """,
             user_id,
         )
-        if sub:
-            return True
-
-        pkg = await conn.fetchval(
-            "SELECT package_id FROM meditations WHERE id=$1",
-            meditation_id,
-        )
-
-        bought = await conn.fetchval(
-            """
-            SELECT 1 FROM purchases
-            WHERE user_id=$1 AND package_id=$2
-            """,
-            user_id,
-            pkg,
-        )
-
-        return bool(bought)
+        return bool(row)
 
 
 # ================= BOT =================
@@ -184,7 +84,39 @@ async def has_access(user_id: int, meditation_id: int) -> bool:
 @dp.message(CommandStart())
 async def start(message: Message):
     await get_or_create_user(message.from_user.id)
-    await message.answer("Добро пожаловать ✨\nОткрой Mini App для медитаций.")
+
+    await message.answer(
+        "Добро пожаловать ✨\n\n"
+        "Открой Mini App и выбери медитацию."
+    )
+
+
+# ---------- BUY HANDLERS ----------
+
+@dp.message(F.text == "💳 Подписка 1 месяц")
+async def buy_1m(message: Message):
+    await bot.send_invoice(
+        chat_id=message.from_user.id,
+        title="Подписка на 1 месяц",
+        description="Доступ ко всем медитациям на 30 дней",
+        payload="sub_1",
+        provider_token=PAY_TOKEN,
+        currency="RUB",
+        prices=[LabeledPrice(label="1 месяц", amount=19900)],
+    )
+
+
+@dp.message(F.text == "💳 Подписка 3 месяца")
+async def buy_3m(message: Message):
+    await bot.send_invoice(
+        chat_id=message.from_user.id,
+        title="Подписка на 3 месяца",
+        description="Доступ ко всем медитациям на 90 дней",
+        payload="sub_3",
+        provider_token=PAY_TOKEN,
+        currency="RUB",
+        prices=[LabeledPrice(label="3 месяца", amount=49900)],
+    )
 
 
 @dp.pre_checkout_query()
@@ -195,8 +127,16 @@ async def pre_checkout(q: PreCheckoutQuery):
 @dp.message(F.successful_payment)
 async def successful_payment(message: Message):
     user_id = await get_or_create_user(message.from_user.id)
-    await give_lifetime_access(user_id)
-    await message.answer("Оплата прошла успешно 🎉\nДоступ открыт навсегда.")
+
+    payload = message.successful_payment.invoice_payload
+
+    if payload == "sub_1":
+        await give_subscription(user_id, 1)
+
+    elif payload == "sub_3":
+        await give_subscription(user_id, 2)
+
+    await message.answer("Оплата прошла успешно 🎉\nПодписка активирована.")
 
 
 # ================= PUBLIC API =================
@@ -217,154 +157,30 @@ async def api_access(request):
     meditation_id = int(request.query["meditation_id"])
 
     user_id = await get_or_create_user(telegram_id)
-    access = await has_access(user_id, meditation_id)
 
+    async with db.acquire() as conn:
+        free = await conn.fetchval(
+            "SELECT is_free FROM meditations WHERE id=$1",
+            meditation_id,
+        )
+
+    if free:
+        return web.json_response({"access": True})
+
+    access = await has_active_subscription(user_id)
     return web.json_response({"access": access})
 
 
-async def api_listen(request):
-    data = await request.json()
-
-    telegram_id = int(data["user_id"])
-    meditation_id = int(data["meditation_id"])
-    seconds = int(data["seconds"])
-    completed = bool(data["completed"])
-
-    user_id = await get_or_create_user(telegram_id)
-
-    await db.execute(
-        """
-        INSERT INTO listens (user_id, meditation_id, seconds_listened, completed)
-        VALUES ($1,$2,$3,$4)
-        """,
-        user_id,
-        meditation_id,
-        seconds,
-        completed,
-    )
-
-    return web.json_response({"ok": True})
-
-
-# ================= ADMIN API =================
-
-async def api_admin_packages(request):
+async def api_plans(request):
     rows = await db.fetch(
-        "SELECT id, title, description, price FROM packages ORDER BY id"
+        """
+        SELECT id, title, price, duration_days
+        FROM subscription_plans
+        WHERE is_active = TRUE
+        ORDER BY price
+        """
     )
     return web.json_response([dict(r) for r in rows])
-
-async def api_create_package(request):
-    data = await request.json()
-
-    await db.execute(
-        """
-        INSERT INTO packages (title, description, price)
-        VALUES ($1, $2, $3)
-        """,
-        data["title"],
-        data.get("description"),
-        int(data.get("price", 0)),
-    )
-
-    return web.json_response({"ok": True})
-
-async def api_admin_sales(request):
-    rows = await db.fetch(
-        """
-        SELECT u.telegram_id, s.plan, s.created_at
-        FROM subscriptions s
-        JOIN users u ON u.id = s.user_id
-        ORDER BY s.created_at DESC
-        LIMIT 100
-        """
-    )
-
-    result = []
-    for r in rows:
-        item = dict(r)
-        item["created_at"] = item["created_at"].isoformat()
-        result.append(item)
-
-    return web.json_response(result)
-
-async def api_update_meditation(request):
-    meditation_id = int(request.match_info["id"])
-    data = await request.json()
-
-    await db.execute(
-        """
-        UPDATE meditations
-        SET title=$1, description=$2
-        WHERE id=$3
-        """,
-        data["title"],
-        data["description"],
-        meditation_id,
-    )
-
-    return web.json_response({"ok": True})
-
-
-async def api_add_meditation(request):
-    reader = await request.multipart()
-
-    title = description = ""
-    package_id = None
-    is_free = False
-    file_path = None
-
-    async for part in reader:
-        if part.name == "title":
-            title = await part.text()
-
-        elif part.name == "description":
-            description = await part.text()
-
-        elif part.name == "package_id":
-            package_id = int(await part.text())
-
-        elif part.name == "is_free":
-            is_free = (await part.text()) == "true"
-
-        elif part.name == "file":
-            file_path = f"/tmp/{part.filename}"
-            with open(file_path, "wb") as f:
-                while chunk := await part.read_chunk():
-                    f.write(chunk)
-
-    if not file_path or not package_id:
-        return web.json_response({"ok": False, "error": "invalid data"}, status=400)
-
-    url, duration = upload_audio(file_path)
-
-    await db.execute(
-        """
-        INSERT INTO meditations
-        (package_id, title, description, audio_url, duration_sec, is_free)
-        VALUES ($1,$2,$3,$4,$5,$6)
-        """,
-        package_id,
-        title,
-        description,
-        url,
-        duration,
-        is_free,
-    )
-
-    return web.json_response({"ok": True})
-
-
-
-async def api_delete_meditation(request):
-    meditation_id = int(request.match_info["id"])
-
-    await db.execute(
-        "DELETE FROM meditations WHERE id=$1",
-        meditation_id,
-    )
-
-    return web.json_response({"ok": True})
 
 
 # ================= WEB =================
@@ -374,27 +190,22 @@ async def start_web():
 
     cors = aiohttp_cors.setup(
         app,
-        defaults={
-            "*": aiohttp_cors.ResourceOptions(
-                allow_credentials=True,
-                expose_headers="*",
-                allow_headers="*",
-                allow_methods="*",
-            )
-        },
+        defaults={"*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*",
+        )},
     )
 
     app.router.add_get("/meditations", api_meditations)
     app.router.add_get("/access", api_access)
-    app.router.add_post("/listen", api_listen)
+    app.router.add_get("/plans", api_plans)
+    app.router.add_get("/admin/plans", api_admin_all_plans)
+    app.router.add_post("/admin/plans", api_admin_create_plan)
+    app.router.add_post("/admin/plans/{id}/toggle", api_admin_toggle_plan)
 
-    app.router.add_get("/admin/sales", api_admin_sales)
-    app.router.add_post("/admin/meditation", api_add_meditation)
-    app.router.add_get("/admin/packages", api_admin_packages)
-    app.router.add_post("/admin/packages", api_create_package)
-    app.router.add_put("/admin/meditation/{id}", api_update_meditation)
-
-    app.router.add_delete("/admin/meditation/{id}", api_delete_meditation)
+    app.router.add_get("/admin/subscriptions", api_admin_subscriptions)
 
     for route in list(app.router.routes()):
         cors.add(route)
@@ -416,3 +227,67 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+# ================= ADMIN: PLANS =================
+
+async def api_admin_all_plans(request):
+    rows = await db.fetch(
+        "SELECT id, title, price, duration_days, is_active FROM subscription_plans ORDER BY id"
+    )
+    return web.json_response([dict(r) for r in rows])
+
+
+async def api_admin_create_plan(request):
+    data = await request.json()
+
+    await db.execute(
+        """
+        INSERT INTO subscription_plans (title, price, duration_days, is_active)
+        VALUES ($1,$2,$3,TRUE)
+        """,
+        data["title"],
+        int(data["price"]),
+        int(data["duration_days"]),
+    )
+
+    return web.json_response({"ok": True})
+
+
+async def api_admin_toggle_plan(request):
+    plan_id = int(request.match_info["id"])
+
+    await db.execute(
+        """
+        UPDATE subscription_plans
+        SET is_active = NOT is_active
+        WHERE id=$1
+        """,
+        plan_id,
+    )
+
+    return web.json_response({"ok": True})
+
+
+# ================= ADMIN: SUBSCRIPTIONS =================
+
+async def api_admin_subscriptions(request):
+    rows = await db.fetch(
+        """
+        SELECT
+            u.telegram_id,
+            p.title AS plan,
+            s.expires_at
+        FROM subscriptions s
+        JOIN users u ON u.id = s.user_id
+        JOIN subscription_plans p ON p.id = s.plan_id
+        ORDER BY s.expires_at DESC
+        LIMIT 100
+        """
+    )
+
+    result = []
+    for r in rows:
+        item = dict(r)
+        item["expires_at"] = item["expires_at"].isoformat()
+        result.append(item)
+
+    return web.json_response(result)
