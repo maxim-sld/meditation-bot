@@ -1,6 +1,6 @@
 import asyncio
-import json
 import os
+import asyncpg
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import (
@@ -12,27 +12,49 @@ from aiogram.types import (
 )
 from aiogram.filters import CommandStart
 
+
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PAY_TOKEN = os.getenv("PAY_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-USERS_FILE = "users.json"
+db: asyncpg.Pool | None = None
 
 
-# ================= USERS =================
+# ================= DB =================
 
-def load_users():
-    if not os.path.exists(USERS_FILE):
-        return {}
-    with open(USERS_FILE, "r") as f:
-        return json.load(f)
+async def init_db():
+    global db
+    db = await asyncpg.create_pool(DATABASE_URL)
+
+    async with db.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id BIGINT PRIMARY KEY,
+                paid BOOLEAN DEFAULT FALSE
+            )
+        """)
 
 
-def save_users(data):
-    with open(USERS_FILE, "w") as f:
-        json.dump(data, f)
+async def set_paid(user_id: int):
+    async with db.acquire() as conn:
+        await conn.execute("""
+            INSERT INTO users (telegram_id, paid)
+            VALUES ($1, TRUE)
+            ON CONFLICT (telegram_id)
+            DO UPDATE SET paid = TRUE
+        """, user_id)
+
+
+async def is_paid(user_id: int) -> bool:
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT paid FROM users WHERE telegram_id=$1",
+            user_id,
+        )
+        return bool(row and row["paid"])
 
 
 # ================= START =================
@@ -81,15 +103,14 @@ async def pre_checkout(pre_checkout_q: PreCheckoutQuery):
 
 @dp.message(F.successful_payment)
 async def successful_payment(message: Message):
-    print("🔥 SUCCESSFUL PAYMENT EVENT")
+    user_id = message.from_user.id
 
-    user_id = str(message.from_user.id)
+    await set_paid(user_id)
 
-    users = load_users()
-    users[user_id] = {"paid": True}
-    save_users(users)
-
-    await message.answer("Оплата прошла успешно! 🎉\n\nВсе медитации открыты.")
+    await message.answer(
+        "Оплата прошла успешно! 🎉\n\n"
+        "Теперь все медитации открыты."
+    )
 
 
 # ================= API =================
@@ -100,11 +121,9 @@ async def check_paid(request):
     if not user_id:
         return web.json_response({"paid": False})
 
-    user_id = str(user_id).strip()
+    paid = await is_paid(int(user_id))
 
-    users = load_users()
-
-    return web.json_response({"paid": user_id in users})
+    return web.json_response({"paid": paid})
 
 
 async def start_web_server():
@@ -122,6 +141,7 @@ async def start_web_server():
 # ================= MAIN =================
 
 async def main():
+    await init_db()
     await start_web_server()
     await dp.start_polling(bot)
 
