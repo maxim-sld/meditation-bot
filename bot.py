@@ -219,12 +219,24 @@ async def api_listen(request):
     )
 
     return web.json_response({"ok": True})
+
 async def api_add_meditation(request):
     reader = await request.multipart()
 
-    title = (await reader.next()).text()
-    description = (await reader.next()).text()
-    package_id = int((await reader.next()).text())
+    title_part = await reader.next()
+    title = await title_part.text()
+
+    desc_part = await reader.next()
+    description = await desc_part.text()
+
+    pkg_part = await reader.next()
+    package_id = int(await pkg_part.text())
+
+    price_part = await reader.next()
+    price = int(await price_part.text())
+
+    free_part = await reader.next()
+    is_free = (await free_part.text()) == "true"
 
     file_part = await reader.next()
     file_path = f"/tmp/{file_part.filename}"
@@ -237,14 +249,16 @@ async def api_add_meditation(request):
 
     await db.execute(
         """
-        INSERT INTO meditations (package_id, title, description, audio_url, duration_sec)
-        VALUES ($1,$2,$3,$4,$5)
+        INSERT INTO meditations
+        (package_id, title, description, audio_url, duration_sec, is_free)
+        VALUES ($1,$2,$3,$4,$5,$6)
         """,
         package_id,
         title,
         description,
         url,
         duration,
+        is_free,
     )
 
     return web.json_response({"ok": True})
