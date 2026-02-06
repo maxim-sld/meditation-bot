@@ -288,6 +288,22 @@ async def api_admin_sales(request):
 
     return web.json_response(result)
 
+async def api_update_meditation(request):
+    meditation_id = int(request.match_info["id"])
+    data = await request.json()
+
+    await db.execute(
+        """
+        UPDATE meditations
+        SET title=$1, description=$2
+        WHERE id=$3
+        """,
+        data["title"],
+        data["description"],
+        meditation_id,
+    )
+
+    return web.json_response({"ok": True})
 
 
 async def api_add_meditation(request):
@@ -361,6 +377,7 @@ async def start_web():
     app.router.add_post("/admin/meditation", api_add_meditation)
     app.router.add_get("/admin/packages", api_admin_packages)
     app.router.add_post("/admin/packages", api_create_package)
+    app.router.add_put("/admin/meditation/{id}", api_update_meditation)
 
     app.router.add_delete("/admin/meditation/{id}", api_delete_meditation)
 
