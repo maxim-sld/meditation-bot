@@ -230,7 +230,44 @@ async def api_admin_sales(request):
         """
     )
 
-    return web.json_response([dict(r) for r in rows])
+    result = []
+    for r in rows:
+        item = dict(r)
+        item["created_at"] = item["created_at"].isoformat()
+        result.append(item)
+
+    return web.json_response(result)
+import boto3
+from mutagen.mp3 import MP3
+import uuid
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=os.getenv("YANDEX_ENDPOINT"),
+    aws_access_key_id=os.getenv("YANDEX_ACCESS_KEY"),
+    aws_secret_access_key=os.getenv("YANDEX_SECRET_KEY"),
+)
+
+
+def upload_audio(file_path: str):
+    bucket = os.getenv("YANDEX_BUCKET")
+
+    filename = f"{uuid.uuid4()}.mp3"
+
+    audio = MP3(file_path)
+    duration = int(audio.info.length)
+
+    s3.upload_file(
+        file_path,
+        bucket,
+        filename,
+        ExtraArgs={"ContentType": "audio/mpeg"},
+    )
+
+    url = f"https://storage.yandexcloud.net/{bucket}/{filename}"
+
+    return url, duration
+
 
 async def api_add_meditation(request):
     reader = await request.multipart()
