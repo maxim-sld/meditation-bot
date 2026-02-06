@@ -219,6 +219,18 @@ async def api_listen(request):
     )
 
     return web.json_response({"ok": True})
+async def api_admin_sales(request):
+    rows = await db.fetch(
+        """
+        SELECT u.telegram_id, s.plan, s.created_at
+        FROM subscriptions s
+        JOIN users u ON u.id = s.user_id
+        ORDER BY s.created_at DESC
+        LIMIT 100
+        """
+    )
+
+    return web.json_response([dict(r) for r in rows])
 
 async def api_add_meditation(request):
     reader = await request.multipart()
