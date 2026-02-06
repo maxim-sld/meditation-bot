@@ -309,18 +309,32 @@ async def api_update_meditation(request):
 async def api_add_meditation(request):
     reader = await request.multipart()
 
-    title = await (await reader.next()).text()
-    description = await (await reader.next()).text()
-    package_id = int(await (await reader.next()).text())
-    _price = await (await reader.next()).text()  # пока не используем
-    is_free = (await (await reader.next()).text()) == "true"
+    title = description = ""
+    package_id = None
+    is_free = False
+    file_path = None
 
-    file_part = await reader.next()
-    file_path = f"/tmp/{file_part.filename}"
+    async for part in reader:
+        if part.name == "title":
+            title = await part.text()
 
-    with open(file_path, "wb") as f:
-        while chunk := await file_part.read_chunk():
-            f.write(chunk)
+        elif part.name == "description":
+            description = await part.text()
+
+        elif part.name == "package_id":
+            package_id = int(await part.text())
+
+        elif part.name == "is_free":
+            is_free = (await part.text()) == "true"
+
+        elif part.name == "file":
+            file_path = f"/tmp/{part.filename}"
+            with open(file_path, "wb") as f:
+                while chunk := await part.read_chunk():
+                    f.write(chunk)
+
+    if not file_path or not package_id:
+        return web.json_response({"ok": False, "error": "invalid data"}, status=400)
 
     url, duration = upload_audio(file_path)
 
@@ -339,6 +353,7 @@ async def api_add_meditation(request):
     )
 
     return web.json_response({"ok": True})
+
 
 
 async def api_delete_meditation(request):
