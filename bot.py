@@ -248,6 +248,27 @@ async def api_listen(request):
 
 # ================= ADMIN API =================
 
+async def api_admin_packages(request):
+    rows = await db.fetch(
+        "SELECT id, title, description, price FROM packages ORDER BY id"
+    )
+    return web.json_response([dict(r) for r in rows])
+
+async def api_create_package(request):
+    data = await request.json()
+
+    await db.execute(
+        """
+        INSERT INTO packages (title, description, price)
+        VALUES ($1, $2, $3)
+        """,
+        data["title"],
+        data.get("description"),
+        int(data.get("price", 0)),
+    )
+
+    return web.json_response({"ok": True})
+
 async def api_admin_sales(request):
     rows = await db.fetch(
         """
@@ -338,6 +359,9 @@ async def start_web():
 
     app.router.add_get("/admin/sales", api_admin_sales)
     app.router.add_post("/admin/meditation", api_add_meditation)
+    app.router.add_get("/admin/packages", api_admin_packages)
+    app.router.add_post("/admin/packages", api_create_package)
+
     app.router.add_delete("/admin/meditation/{id}", api_delete_meditation)
 
     for route in list(app.router.routes()):
