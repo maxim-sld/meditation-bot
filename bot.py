@@ -1,15 +1,10 @@
 import asyncio
 import os
 import asyncpg
+from datetime import datetime, timedelta
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import (
-    Message,
-    LabeledPrice,
-    PreCheckoutQuery,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-)
+from aiogram.types import Message, LabeledPrice, PreCheckoutQuery
 from aiogram.filters import CommandStart
 
 
@@ -19,163 +14,234 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+db: asyncpg.Pool
 
-db: asyncpg.Pool | None = None
 
-
-# ================= DB =================
+# ================= DB INIT =================
 
 async def init_db():
     global db
     db = await asyncpg.create_pool(DATABASE_URL)
 
     async with db.acquire() as conn:
-        # таблица пользователей
         await conn.execute("""
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id BIGINT PRIMARY KEY,
-                paid BOOLEAN DEFAULT FALSE
-            )
+        CREATE TABLE IF NOT EXISTS users (
+            id BIGSERIAL PRIMARY KEY,
+            telegram_id BIGINT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS packages (
+            id BIGSERIAL PRIMARY KEY,
+            title TEXT NOT NULL,
+            description TEXT,
+            price INT NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS meditations (
+            id BIGSERIAL PRIMARY KEY,
+            package_id BIGINT REFERENCES packages(id) ON DELETE CASCADE,
+            title TEXT NOT NULL,
+            description TEXT,
+            audio_url TEXT NOT NULL,
+            duration_sec INT,
+            is_free BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS purchases (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+            package_id BIGINT REFERENCES packages(id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            UNIQUE(user_id, package_id)
+        );
+
+        CREATE TABLE IF NOT EXISTS subscriptions (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+            plan TEXT NOT NULL,
+            expires_at TIMESTAMP NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS listens (
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+            meditation_id BIGINT REFERENCES meditations(id) ON DELETE CASCADE,
+            seconds_listened INT,
+            completed BOOLEAN,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
         """)
 
-        # таблица логов оплат
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS payments (
-                id SERIAL PRIMARY KEY,
-                telegram_id BIGINT NOT NULL,
-                payload TEXT,
-                amount INTEGER,
-                currency TEXT,
-                created_at TIMESTAMP DEFAULT NOW()
-            )
-        """)
 
+# ================= USERS =================
 
-async def set_paid(user_id: int):
-    async with db.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO users (telegram_id, paid)
-            VALUES ($1, TRUE)
-            ON CONFLICT (telegram_id)
-            DO UPDATE SET paid = TRUE
-        """, user_id)
-
-
-async def log_payment(user_id: int, payload: str, amount: int, currency: str):
-    async with db.acquire() as conn:
-        await conn.execute("""
-            INSERT INTO payments (telegram_id, payload, amount, currency)
-            VALUES ($1, $2, $3, $4)
-        """, user_id, payload, amount, currency)
-
-
-async def is_paid(user_id: int) -> bool:
+async def get_or_create_user(telegram_id: int) -> int:
     async with db.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT paid FROM users WHERE telegram_id=$1",
+            """
+            INSERT INTO users (telegram_id)
+            VALUES ($1)
+            ON CONFLICT (telegram_id)
+            DO UPDATE SET telegram_id = EXCLUDED.telegram_id
+            RETURNING id
+            """,
+            telegram_id,
+        )
+        return row["id"]
+
+
+# ================= ACCESS =================
+
+async def give_lifetime_access(user_id: int):
+    async with db.acquire() as conn:
+        await conn.execute(
+            """
+            INSERT INTO subscriptions (user_id, plan, expires_at)
+            VALUES ($1, 'lifetime', '2100-01-01')
+            """,
             user_id,
         )
-        return bool(row and row["paid"])
 
 
-# ================= START =================
+async def has_access(user_id: int, meditation_id: int) -> bool:
+    async with db.acquire() as conn:
+
+        # бесплатная медитация
+        free = await conn.fetchval(
+            "SELECT is_free FROM meditations WHERE id=$1",
+            meditation_id,
+        )
+        if free:
+            return True
+
+        # активная подписка
+        sub = await conn.fetchval(
+            """
+            SELECT 1 FROM subscriptions
+            WHERE user_id=$1 AND expires_at > NOW()
+            """,
+            user_id,
+        )
+        if sub:
+            return True
+
+        # покупка пакета
+        pkg = await conn.fetchval(
+            "SELECT package_id FROM meditations WHERE id=$1",
+            meditation_id,
+        )
+
+        bought = await conn.fetchval(
+            """
+            SELECT 1 FROM purchases
+            WHERE user_id=$1 AND package_id=$2
+            """,
+            user_id,
+            pkg,
+        )
+
+        return bool(bought)
+
+
+# ================= BOT =================
 
 @dp.message(CommandStart())
 async def start(message: Message):
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💳 Купить полный доступ", callback_data="buy")]
-        ]
-    )
+    await get_or_create_user(message.from_user.id)
+    await message.answer("Добро пожаловать ✨\nОткрой Mini App для медитаций.")
 
-    await message.answer(
-        "Добро пожаловать ✨\n\n"
-        "Чтобы открыть все медитации — нажмите кнопку ниже 👇",
-        reply_markup=kb,
-    )
-
-
-# ================= BUY =================
-
-@dp.callback_query(F.data == "buy")
-async def buy(callback):
-    prices = [LabeledPrice(label="Доступ ко всем медитациям", amount=19900)]
-
-    await bot.send_invoice(
-        chat_id=callback.from_user.id,
-        title="Полный доступ к медитациям",
-        description="Разблокирует все медитации навсегда",
-        payload="meditation_access",
-        provider_token=PAY_TOKEN,
-        currency="RUB",
-        prices=prices,
-        start_parameter="buy_access",
-    )
-
-
-# ================= PRE CHECKOUT =================
 
 @dp.pre_checkout_query()
-async def pre_checkout(pre_checkout_q: PreCheckoutQuery):
-    await bot.answer_pre_checkout_query(pre_checkout_q.id, ok=True)
+async def pre_checkout(q: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(q.id, ok=True)
 
-
-# ================= SUCCESS =================
 
 @dp.message(F.successful_payment)
 async def successful_payment(message: Message):
-    payment = message.successful_payment
-    user_id = message.from_user.id
+    user_id = await get_or_create_user(message.from_user.id)
+    await give_lifetime_access(user_id)
 
-    # выдаём доступ
-    await set_paid(user_id)
-
-    # логируем оплату
-    await log_payment(
-        user_id=user_id,
-        payload=payment.invoice_payload,
-        amount=payment.total_amount,
-        currency=payment.currency,
-    )
-
-    await message.answer(
-        "Оплата прошла успешно! 🎉\n\n"
-        "Теперь все медитации открыты."
-    )
+    await message.answer("Оплата прошла успешно 🎉\nДоступ открыт навсегда.")
 
 
 # ================= API =================
 
-async def check_paid(request):
-    user_id = request.query.get("user_id")
-
-    if not user_id:
-        return web.json_response({"paid": False})
-
-    paid = await is_paid(int(user_id))
-
-    return web.json_response({"paid": paid})
+async def api_me(request):
+    telegram_id = int(request.query["user_id"])
+    user_id = await get_or_create_user(telegram_id)
+    return web.json_response({"user_id": user_id})
 
 
-# ================= WEB SERVER =================
+async def api_meditations(request):
+    rows = await db.fetch(
+        """
+        SELECT id, title, description, audio_url, duration_sec, is_free
+        FROM meditations
+        ORDER BY id
+        """
+    )
+    return web.json_response([dict(r) for r in rows])
 
-async def start_web_server():
+
+async def api_access(request):
+    telegram_id = int(request.query["user_id"])
+    meditation_id = int(request.query["meditation_id"])
+
+    user_id = await get_or_create_user(telegram_id)
+    access = await has_access(user_id, meditation_id)
+
+    return web.json_response({"access": access})
+
+
+async def api_listen(request):
+    data = await request.json()
+
+    telegram_id = int(data["user_id"])
+    meditation_id = int(data["meditation_id"])
+    seconds = int(data["seconds"])
+    completed = bool(data["completed"])
+
+    user_id = await get_or_create_user(telegram_id)
+
+    await db.execute(
+        """
+        INSERT INTO listens (user_id, meditation_id, seconds_listened, completed)
+        VALUES ($1,$2,$3,$4)
+        """,
+        user_id,
+        meditation_id,
+        seconds,
+        completed,
+    )
+
+    return web.json_response({"ok": True})
+
+
+# ================= WEB =================
+
+async def start_web():
     app = web.Application()
-    app.router.add_get("/check", check_paid)
+    app.router.add_get("/me", api_me)
+    app.router.add_get("/meditations", api_meditations)
+    app.router.add_get("/access", api_access)
+    app.router.add_post("/listen", api_listen)
 
     port = int(os.environ.get("PORT", 8080))
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
-    await site.start()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
 
 
 # ================= MAIN =================
 
 async def main():
-    await init_db()
-    await start_web_server()
+    await init_db()   # ← авто-создание таблиц
+    await start_web()
     await dp.start_polling(bot)
 
 
