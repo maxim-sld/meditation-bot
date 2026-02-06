@@ -265,6 +265,15 @@ async def api_add_meditation(request):
 
 
 # ================= WEB =================
+async def api_delete_meditation(request):
+    meditation_id = int(request.match_info["id"])
+
+    await db.execute(
+        "DELETE FROM meditations WHERE id=$1",
+        meditation_id,
+    )
+
+    return web.json_response({"ok": True})
 
 import aiohttp_cors
 
