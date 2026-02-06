@@ -219,6 +219,35 @@ async def api_listen(request):
     )
 
     return web.json_response({"ok": True})
+async def api_add_meditation(request):
+    reader = await request.multipart()
+
+    title = (await reader.next()).text()
+    description = (await reader.next()).text()
+    package_id = int((await reader.next()).text())
+
+    file_part = await reader.next()
+    file_path = f"/tmp/{file_part.filename}"
+
+    with open(file_path, "wb") as f:
+        while chunk := await file_part.read_chunk():
+            f.write(chunk)
+
+    url, duration = upload_audio(file_path)
+
+    await db.execute(
+        """
+        INSERT INTO meditations (package_id, title, description, audio_url, duration_sec)
+        VALUES ($1,$2,$3,$4,$5)
+        """,
+        package_id,
+        title,
+        description,
+        url,
+        duration,
+    )
+
+    return web.json_response({"ok": True})
 
 
 # ================= WEB =================
@@ -229,6 +258,7 @@ async def start_web():
     app.router.add_get("/meditations", api_meditations)
     app.router.add_get("/access", api_access)
     app.router.add_post("/listen", api_listen)
+    app.router.add_post("/admin/meditation", api_add_meditation)
 
     port = int(os.environ.get("PORT", 8080))
 
