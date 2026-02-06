@@ -266,13 +266,36 @@ async def api_add_meditation(request):
 
 # ================= WEB =================
 
+import aiohttp_cors
+
 async def start_web():
     app = web.Application()
+
+    # CORS настройка
+    cors = aiohttp_cors.setup(
+        app,
+        defaults={
+            "*": aiohttp_cors.ResourceOptions(
+                allow_credentials=True,
+                expose_headers="*",
+                allow_headers="*",
+                allow_methods="*",
+            )
+        },
+    )
+
+    # Роуты
     app.router.add_get("/me", api_me)
     app.router.add_get("/meditations", api_meditations)
     app.router.add_get("/access", api_access)
     app.router.add_post("/listen", api_listen)
     app.router.add_post("/admin/meditation", api_add_meditation)
+    app.router.add_delete("/admin/meditation/{id}", api_delete_meditation)
+    app.router.add_get("/admin/sales", api_admin_sales)
+
+    # применяем CORS ко всем роутам
+    for route in list(app.router.routes()):
+        cors.add(route)
 
     port = int(os.environ.get("PORT", 8080))
 

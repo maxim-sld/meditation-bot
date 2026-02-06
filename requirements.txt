@@ -4,3 +4,4 @@ asyncpg
 python-dotenv
 boto3
 mutagen
+aiohttp-cors
