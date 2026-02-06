@@ -1,10 +1,15 @@
 import asyncio
 import os
 import asyncpg
-from datetime import datetime, timedelta
+import boto3
+import uuid
+
+from mutagen.mp3 import MP3
 from aiohttp import web
+import aiohttp_cors
+
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, LabeledPrice, PreCheckoutQuery
+from aiogram.types import Message, PreCheckoutQuery
 from aiogram.filters import CommandStart
 
 
@@ -15,6 +20,36 @@ DATABASE_URL = os.getenv("DATABASE_URL")
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 db: asyncpg.Pool
+
+
+# ================= YANDEX STORAGE =================
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=os.getenv("YANDEX_ENDPOINT"),
+    aws_access_key_id=os.getenv("YANDEX_ACCESS_KEY"),
+    aws_secret_access_key=os.getenv("YANDEX_SECRET_KEY"),
+)
+
+
+def upload_audio(file_path: str):
+    bucket = os.getenv("YANDEX_BUCKET")
+
+    filename = f"{uuid.uuid4()}.mp3"
+
+    audio = MP3(file_path)
+    duration = int(audio.info.length)
+
+    s3.upload_file(
+        file_path,
+        bucket,
+        filename,
+        ExtraArgs={"ContentType": "audio/mpeg"},
+    )
+
+    url = f"https://storage.yandexcloud.net/{bucket}/{filename}"
+
+    return url, duration
 
 
 # ================= DB INIT =================
@@ -110,7 +145,6 @@ async def give_lifetime_access(user_id: int):
 async def has_access(user_id: int, meditation_id: int) -> bool:
     async with db.acquire() as conn:
 
-        # бесплатная медитация
         free = await conn.fetchval(
             "SELECT is_free FROM meditations WHERE id=$1",
             meditation_id,
@@ -118,7 +152,6 @@ async def has_access(user_id: int, meditation_id: int) -> bool:
         if free:
             return True
 
-        # активная подписка
         sub = await conn.fetchval(
             """
             SELECT 1 FROM subscriptions
@@ -129,7 +162,6 @@ async def has_access(user_id: int, meditation_id: int) -> bool:
         if sub:
             return True
 
-        # покупка пакета
         pkg = await conn.fetchval(
             "SELECT package_id FROM meditations WHERE id=$1",
             meditation_id,
@@ -164,17 +196,10 @@ async def pre_checkout(q: PreCheckoutQuery):
 async def successful_payment(message: Message):
     user_id = await get_or_create_user(message.from_user.id)
     await give_lifetime_access(user_id)
-
     await message.answer("Оплата прошла успешно 🎉\nДоступ открыт навсегда.")
 
 
-# ================= API =================
-
-async def api_me(request):
-    telegram_id = int(request.query["user_id"])
-    user_id = await get_or_create_user(telegram_id)
-    return web.json_response({"user_id": user_id})
-
+# ================= PUBLIC API =================
 
 async def api_meditations(request):
     rows = await db.fetch(
@@ -219,6 +244,10 @@ async def api_listen(request):
     )
 
     return web.json_response({"ok": True})
+
+
+# ================= ADMIN API =================
+
 async def api_admin_sales(request):
     rows = await db.fetch(
         """
@@ -237,55 +266,16 @@ async def api_admin_sales(request):
         result.append(item)
 
     return web.json_response(result)
-import boto3
-from mutagen.mp3 import MP3
-import uuid
-
-s3 = boto3.client(
-    "s3",
-    endpoint_url=os.getenv("YANDEX_ENDPOINT"),
-    aws_access_key_id=os.getenv("YANDEX_ACCESS_KEY"),
-    aws_secret_access_key=os.getenv("YANDEX_SECRET_KEY"),
-)
-
-
-def upload_audio(file_path: str):
-    bucket = os.getenv("YANDEX_BUCKET")
-
-    filename = f"{uuid.uuid4()}.mp3"
-
-    audio = MP3(file_path)
-    duration = int(audio.info.length)
-
-    s3.upload_file(
-        file_path,
-        bucket,
-        filename,
-        ExtraArgs={"ContentType": "audio/mpeg"},
-    )
-
-    url = f"https://storage.yandexcloud.net/{bucket}/{filename}"
-
-    return url, duration
 
 
 async def api_add_meditation(request):
     reader = await request.multipart()
 
-    title_part = await reader.next()
-    title = await title_part.text()
-
-    desc_part = await reader.next()
-    description = await desc_part.text()
-
-    pkg_part = await reader.next()
-    package_id = int(await pkg_part.text())
-
-    price_part = await reader.next()
-    price = int(await price_part.text())
-
-    free_part = await reader.next()
-    is_free = (await free_part.text()) == "true"
+    title = await (await reader.next()).text()
+    description = await (await reader.next()).text()
+    package_id = int(await (await reader.next()).text())
+    _price = await (await reader.next()).text()  # пока не используем
+    is_free = (await (await reader.next()).text()) == "true"
 
     file_part = await reader.next()
     file_path = f"/tmp/{file_part.filename}"
@@ -313,7 +303,6 @@ async def api_add_meditation(request):
     return web.json_response({"ok": True})
 
 
-# ================= WEB =================
 async def api_delete_meditation(request):
     meditation_id = int(request.match_info["id"])
 
@@ -324,12 +313,12 @@ async def api_delete_meditation(request):
 
     return web.json_response({"ok": True})
 
-import aiohttp_cors
+
+# ================= WEB =================
 
 async def start_web():
     app = web.Application()
 
-    # CORS настройка
     cors = aiohttp_cors.setup(
         app,
         defaults={
@@ -342,16 +331,14 @@ async def start_web():
         },
     )
 
-    # Роуты
-    app.router.add_get("/me", api_me)
     app.router.add_get("/meditations", api_meditations)
     app.router.add_get("/access", api_access)
     app.router.add_post("/listen", api_listen)
+
+    app.router.add_get("/admin/sales", api_admin_sales)
     app.router.add_post("/admin/meditation", api_add_meditation)
     app.router.add_delete("/admin/meditation/{id}", api_delete_meditation)
-    app.router.add_get("/admin/sales", api_admin_sales)
 
-    # применяем CORS ко всем роутам
     for route in list(app.router.routes()):
         cors.add(route)
 
@@ -365,7 +352,7 @@ async def start_web():
 # ================= MAIN =================
 
 async def main():
-    await init_db()   # ← авто-создание таблиц
+    await init_db()
     await start_web()
     await dp.start_polling(bot)
 
