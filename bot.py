@@ -12,7 +12,7 @@ import uuid
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, PreCheckoutQuery, LabeledPrice
 from aiogram.filters import CommandStart
-from aiogram.filters.command import CommandObject  # Правильный импорт для версии 3.3.0
+from aiogram.filters.command import CommandObject
 
 # Для работы с S3
 try:
@@ -36,6 +36,12 @@ S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY")
 S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
 S3_REGION = os.getenv("S3_REGION", "ru-central1")
 
+# Проверяем обязательные переменные
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is required")
+
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 db: asyncpg.Pool
@@ -57,8 +63,7 @@ async def upload_to_s3(file_data: bytes, file_name: str, content_type: str = "au
             endpoint_url=S3_ENDPOINT_URL,
             aws_access_key_id=S3_ACCESS_KEY_ID,
             aws_secret_access_key=S3_SECRET_ACCESS_KEY,
-            region_name=S3_REGION,
-            config=AioConfig(signature_version='s3v4')
+            region_name=S3_REGION
         ) as s3:
             # Генерируем уникальное имя файла
             unique_filename = f"{uuid.uuid4()}_{file_name}"
@@ -96,8 +101,7 @@ async def delete_from_s3(file_url: str):
             endpoint_url=S3_ENDPOINT_URL,
             aws_access_key_id=S3_ACCESS_KEY_ID,
             aws_secret_access_key=S3_SECRET_ACCESS_KEY,
-            region_name=S3_REGION,
-            config=AioConfig(signature_version='s3v4')
+            region_name=S3_REGION
         ) as s3:
             await s3.delete_object(
                 Bucket=S3_BUCKET_NAME,
@@ -105,30 +109,14 @@ async def delete_from_s3(file_url: str):
             )
     except Exception as e:
         print(f"Error deleting from S3: {e}")
-        # Не падаем, если не удалось удалить файл
-
-# ================= Без S3 fallback =================
-
-async def handle_audio_upload(file_data: bytes, file_name: str, content_type: str) -> str:
-    """Обработка загрузки аудио (с S3 или без)"""
-    try:
-        # Пробуем загрузить в S3
-        if S3_AVAILABLE and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
-            return await upload_to_s3(file_data, file_name, content_type)
-    except Exception as e:
-        print(f"S3 upload failed: {e}")
-    
-    # Fallback: сохраняем URL как есть (например, если файл уже загружен)
-    # Или можно использовать другой сервис
-    raise RuntimeError("S3 is not configured properly. Please check your S3 credentials.")
-
-# Остальной код остается таким же...
 
 # ================= DB INIT =================
 
 async def init_db():
     global db
     db = await asyncpg.create_pool(DATABASE_URL)
+    
+    print("Database connection established")
 
     async with db.acquire() as conn:
         try:
@@ -203,6 +191,7 @@ async def init_db():
         except Exception as e:
             print(f"Database initialization error: {e}")
             raise
+
 # ================= AUTH UTILS =================
 
 def create_jwt(username: str) -> str:
@@ -242,7 +231,6 @@ async def auth_middleware(request: web.Request, handler):
     
     return await handler(request)
 
-
 # ================= USERS =================
 
 async def get_or_create_user(telegram_id: int) -> int:
@@ -259,7 +247,6 @@ async def get_or_create_user(telegram_id: int) -> int:
         )
         return row["id"]
 
-
 # ================= SUBSCRIPTIONS =================
 
 async def give_subscription(user_id: int, plan_id: int):
@@ -268,6 +255,9 @@ async def give_subscription(user_id: int, plan_id: int):
             "SELECT duration_days FROM subscription_plans WHERE id=$1",
             plan_id,
         )
+
+        if not plan:
+            raise ValueError("Plan not found")
 
         expires = datetime.utcnow() + timedelta(days=plan["duration_days"])
 
@@ -281,7 +271,6 @@ async def give_subscription(user_id: int, plan_id: int):
             expires,
         )
 
-
 async def has_active_subscription(user_id: int) -> bool:
     async with db.acquire() as conn:
         row = await conn.fetchval(
@@ -290,41 +279,43 @@ async def has_active_subscription(user_id: int) -> bool:
         )
         return bool(row)
 
-
 # ================= BOT =================
 
 @dp.message(CommandStart())
 async def start(message: Message, command: CommandObject = None):
-    await get_or_create_user(message.from_user.id)
-    
-    # Обработка deep link для покупки
-    if command and command.args and command.args.startswith("buy_"):
-        try:
-            plan_id = int(command.args.split("_")[1])
-            
-            async with db.acquire() as conn:
-                plan = await conn.fetchrow(
-                    "SELECT title, price FROM subscription_plans WHERE id=$1 AND is_active=TRUE",
-                    plan_id,
-                )
-            
-            if plan:
-                await bot.send_invoice(
-                    chat_id=message.from_user.id,
-                    title=plan["title"],
-                    description="Подписка на медитации",
-                    payload=f"plan_{plan_id}",
-                    provider_token=PAY_TOKEN,
-                    currency="RUB",
-                    prices=[LabeledPrice(label=plan["title"], amount=plan["price"])],
-                )
-                return
+    try:
+        await get_or_create_user(message.from_user.id)
         
-        except (ValueError, IndexError):
-            pass
-    
-    await message.answer("Открой Mini App и выбери медитацию ✨")
-
+        # Обработка deep link для покупки
+        if command and command.args and command.args.startswith("buy_"):
+            try:
+                plan_id = int(command.args.split("_")[1])
+                
+                async with db.acquire() as conn:
+                    plan = await conn.fetchrow(
+                        "SELECT title, price FROM subscription_plans WHERE id=$1 AND is_active=TRUE",
+                        plan_id,
+                    )
+                
+                if plan:
+                    await bot.send_invoice(
+                        chat_id=message.from_user.id,
+                        title=plan["title"],
+                        description="Подписка на медитации",
+                        payload=f"plan_{plan_id}",
+                        provider_token=PAY_TOKEN,
+                        currency="RUB",
+                        prices=[LabeledPrice(label=plan["title"], amount=plan["price"])],
+                    )
+                    return
+            
+            except (ValueError, IndexError) as e:
+                print(f"Error processing buy command: {e}")
+        
+        await message.answer("Открой Mini App и выбери медитацию ✨")
+    except Exception as e:
+        print(f"Error in start command: {e}")
+        await message.answer("Произошла ошибка. Попробуйте позже.")
 
 @dp.message(F.text.startswith("💳 Купить"))
 async def buy_plan(message: Message):
@@ -354,23 +345,24 @@ async def buy_plan(message: Message):
         prices=[LabeledPrice(label=plan["title"], amount=plan["price"])],
     )
 
-
 @dp.pre_checkout_query()
 async def pre_checkout(q: PreCheckoutQuery):
     await bot.answer_pre_checkout_query(q.id, ok=True)
 
-
 @dp.message(F.successful_payment)
 async def successful_payment(message: Message):
-    user_id = await get_or_create_user(message.from_user.id)
+    try:
+        user_id = await get_or_create_user(message.from_user.id)
 
-    payload = message.successful_payment.invoice_payload
-    plan_id = int(payload.split("_")[1])
+        payload = message.successful_payment.invoice_payload
+        plan_id = int(payload.split("_")[1])
 
-    await give_subscription(user_id, plan_id)
+        await give_subscription(user_id, plan_id)
 
-    await message.answer("Подписка активирована 🎉")
-
+        await message.answer("Подписка активирована 🎉")
+    except Exception as e:
+        print(f"Error processing payment: {e}")
+        await message.answer("Ошибка при активации подписки. Обратитесь в поддержку.")
 
 # ================= PUBLIC API =================
 
@@ -381,8 +373,8 @@ async def api_meditations(request):
         )
         return web.json_response([dict(r) for r in rows])
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
+        print(f"Error in api_meditations: {e}")
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 async def api_access(request):
     try:
@@ -411,8 +403,8 @@ async def api_access(request):
 
         return web.json_response({"access": await has_active_subscription(user_id)})
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
+        print(f"Error in api_access: {e}")
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 async def api_plans(request):
     try:
@@ -421,8 +413,8 @@ async def api_plans(request):
         )
         return web.json_response([dict(r) for r in rows])
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
+        print(f"Error in api_plans: {e}")
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 # ================= ADMIN AUTH =================
 
@@ -452,8 +444,8 @@ async def api_admin_login(request):
             "user": {"id": user["id"], "username": user["username"]}
         })
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
+        print(f"Error in api_admin_login: {e}")
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 async def api_admin_verify(request):
     auth_header = request.headers.get('Authorization')
@@ -468,7 +460,6 @@ async def api_admin_verify(request):
     
     return web.json_response({"valid": True, "username": payload["sub"]})
 
-
 # ================= ADMIN MEDITATIONS =================
 
 async def api_admin_all_meditations(request):
@@ -476,11 +467,14 @@ async def api_admin_all_meditations(request):
         rows = await db.fetch("SELECT * FROM meditations ORDER BY id")
         return web.json_response([dict(r) for r in rows])
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
+        print(f"Error in api_admin_all_meditations: {e}")
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 async def api_admin_create_meditation(request):
     try:
+        if not S3_AVAILABLE or not all([S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+            return web.json_response({"error": "S3 storage is not configured"}, status=500)
+        
         reader = await request.multipart()
         
         fields = {}
@@ -526,8 +520,8 @@ async def api_admin_create_meditation(request):
         
         return web.json_response({"ok": True})
     except Exception as e:
+        print(f"Error in api_admin_create_meditation: {e}")
         return web.json_response({"error": str(e)}, status=500)
-
 
 async def api_admin_update_meditation(request):
     try:
@@ -549,8 +543,8 @@ async def api_admin_update_meditation(request):
         
         return web.json_response({"ok": True})
     except Exception as e:
+        print(f"Error in api_admin_update_meditation: {e}")
         return web.json_response({"error": str(e)}, status=500)
-
 
 async def api_admin_delete_meditation(request):
     try:
@@ -575,8 +569,8 @@ async def api_admin_delete_meditation(request):
         
         return web.json_response({"ok": True})
     except Exception as e:
+        print(f"Error in api_admin_delete_meditation: {e}")
         return web.json_response({"error": str(e)}, status=500)
-
 
 # ================= ADMIN PLANS =================
 
@@ -585,12 +579,15 @@ async def api_admin_all_plans(request):
         rows = await db.fetch("SELECT * FROM subscription_plans ORDER BY id")
         return web.json_response([dict(r) for r in rows])
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
+        print(f"Error in api_admin_all_plans: {e}")
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 async def api_admin_create_plan(request):
     try:
         data = await request.json()
+        
+        if not data.get("title") or not data.get("price") or not data.get("duration_days"):
+            return web.json_response({"error": "Missing required fields"}, status=400)
         
         await db.execute(
             "INSERT INTO subscription_plans (title, price, duration_days) VALUES ($1,$2,$3)",
@@ -601,8 +598,8 @@ async def api_admin_create_plan(request):
 
         return web.json_response({"ok": True})
     except Exception as e:
+        print(f"Error in api_admin_create_plan: {e}")
         return web.json_response({"error": str(e)}, status=500)
-
 
 async def api_admin_toggle_plan(request):
     try:
@@ -615,8 +612,8 @@ async def api_admin_toggle_plan(request):
 
         return web.json_response({"ok": True})
     except Exception as e:
+        print(f"Error in api_admin_toggle_plan: {e}")
         return web.json_response({"error": str(e)}, status=500)
-
 
 # ================= ADMIN SUBSCRIPTIONS =================
 
@@ -632,8 +629,8 @@ async def api_admin_subscriptions(request):
         """)
         return web.json_response([dict(r) for r in rows])
     except Exception as e:
-        return web.json_response({"error": str(e)}, status=500)
-
+        print(f"Error in api_admin_subscriptions: {e}")
+        return web.json_response({"error": "Internal server error"}, status=500)
 
 # ================= HEALTH CHECK =================
 
@@ -642,18 +639,17 @@ async def api_health(request):
         "status": "ok", 
         "timestamp": datetime.utcnow().isoformat(),
         "services": {
-            "database": "connected" if db else "disconnected",
-            "s3": "configured" if S3_ACCESS_KEY_ID else "not_configured"
+            "database": "connected",
+            "s3": "configured" if S3_AVAILABLE and S3_ACCESS_KEY_ID else "not_configured"
         }
     })
-
 
 # ================= WEB =================
 
 async def start_web():
     app = web.Application(middlewares=[auth_middleware])
     
-    # Настройка CORS - разрешаем запросы с Vercel и локальной разработки
+    # Настройка CORS
     cors = aiohttp_cors.setup(
         app,
         defaults={
@@ -693,19 +689,30 @@ async def start_web():
         cors.add(route)
 
     port = int(os.environ.get("PORT", 8080))
-
+    
+    print(f"Starting web server on port {port}")
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", port).start()
 
-
 # ================= MAIN =================
 
 async def main():
+    print("Starting application...")
+    
+    # Инициализация базы данных
+    print("Initializing database...")
     await init_db()
+    print("Database initialized successfully")
+    
+    # Запуск веб-сервера
+    print("Starting web server...")
     await start_web()
+    print("Web server started successfully")
+    
+    # Запуск бота
+    print("Starting bot polling...")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
