@@ -212,27 +212,50 @@ def verify_jwt(token: str) -> Optional[dict]:
         return None
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
-    # Разрешаем OPTIONS запросы без проверки токена (для CORS preflight)
+    # Разрешаем OPTIONS запросы (preflight для CORS)
     if request.method == "OPTIONS":
-        return await handler(request)
+        return web.Response(
+            status=200,
+            headers={
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+                'Access-Control-Allow-Credentials': 'true',
+            }
+        )
     
     # Пропускаем публичные эндпоинты
     public_paths = ['/meditations', '/access', '/plans', '/admin/login', '/health']
     if any(request.path.startswith(path) for path in public_paths):
-        return await handler(request)
+        response = await handler(request)
+        # Добавляем CORS заголовки
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        return response
     
     # Проверяем токен для админских путей
     if request.path.startswith('/admin'):
         auth_header = request.headers.get('Authorization')
         if not auth_header or not auth_header.startswith('Bearer '):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
+            response = web.json_response({'error': 'Unauthorized'}, status=401)
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
         
         token = auth_header.split(' ')[1]
         payload = verify_jwt(token)
         if not payload:
-            return web.json_response({'error': 'Invalid token'}, status=401)
+            response = web.json_response({'error': 'Invalid token'}, status=401)
+            response.headers['Access-Control-Allow-Origin'] = '*'
+            response.headers['Access-Control-Allow-Credentials'] = 'true'
+            return response
     
-    return await handler(request)
+    # Обрабатываем запрос
+    response = await handler(request)
+    # Добавляем CORS заголовки
+    response.headers['Access-Control-Allow-Origin'] = '*'
+    response.headers['Access-Control-Allow-Credentials'] = 'true'
+    return response
 
 # ================= USERS =================
 
@@ -649,22 +672,14 @@ async def api_health(request):
 
 # ================= WEB =================
 
+# УДАЛИТЕ импорт aiohttp_cors:
+# import aiohttp_cors  # <-- УДАЛИТЬ эту строку
+
+# ... остальной код остается ...
+
 async def start_web():
     app = web.Application(middlewares=[auth_middleware])
     
-    # Настройка CORS
-    cors = aiohttp_cors.setup(
-        app,
-        defaults={
-            "*": aiohttp_cors.ResourceOptions(
-                allow_credentials=True,
-                expose_headers="*",
-                allow_headers="*",
-                allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
-            )
-        },
-    )
-
     # Публичные эндпоинты
     app.router.add_get("/meditations", api_meditations)
     app.router.add_get("/access", api_access)
@@ -675,7 +690,7 @@ async def start_web():
     app.router.add_post("/admin/login", api_admin_login)
     app.router.add_get("/admin/verify", api_admin_verify)
     
-    # Админские эндпоинты (требуют JWT)
+    # Админские эндпоинты
     app.router.add_get("/admin/meditations", api_admin_all_meditations)
     app.router.add_post("/admin/meditation", api_admin_create_meditation)
     app.router.add_put("/admin/meditation/{id}", api_admin_update_meditation)
@@ -686,29 +701,6 @@ async def start_web():
     app.router.add_post("/admin/plans/{id}/toggle", api_admin_toggle_plan)
     
     app.router.add_get("/admin/subscriptions", api_admin_subscriptions)
-
-    # Явно добавляем OPTIONS для всех путей
-    for route in list(app.router.routes()):
-        cors.add(route)
-    
-    # Добавляем обработчик OPTIONS для всех путей
-    async def options_handler(request):
-        return web.Response(
-            status=200,
-            headers={
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                'Access-Control-Allow-Headers': 'Authorization, Content-Type',
-                'Access-Control-Allow-Credentials': 'true',
-            }
-        )
-    
-    # Регистрируем OPTIONS для всех путей
-    for resource in app.router.resources():
-        # Получаем путь ресурса
-        path = resource.canonical
-        # Добавляем OPTIONS метод
-        app.router.add_route('OPTIONS', path, options_handler)
 
     port = int(os.environ.get("PORT", 8080))
     
