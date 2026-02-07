@@ -131,53 +131,78 @@ async def init_db():
     db = await asyncpg.create_pool(DATABASE_URL)
 
     async with db.acquire() as conn:
-        await conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id BIGSERIAL PRIMARY KEY,
-            telegram_id BIGINT UNIQUE NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS meditations (
-            id BIGSERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            description TEXT,
-            audio_url TEXT,
-            duration_sec INT DEFAULT 0,
-            is_free BOOLEAN DEFAULT FALSE,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS subscription_plans (
-            id BIGSERIAL PRIMARY KEY,
-            title TEXT NOT NULL,
-            price INT NOT NULL,
-            duration_days INT NOT NULL,
-            is_active BOOLEAN DEFAULT TRUE,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id BIGSERIAL PRIMARY KEY,
-            user_id BIGINT REFERENCES users(id),
-            plan_id BIGINT REFERENCES subscription_plans(id),
-            expires_at TIMESTAMP,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        CREATE TABLE IF NOT EXISTS admin_users (
-            id SERIAL PRIMARY KEY,
-            username VARCHAR(50) UNIQUE NOT NULL,
-            password_hash VARCHAR(255) NOT NULL,
-            created_at TIMESTAMP DEFAULT NOW()
-        );
-
-        INSERT INTO admin_users (username, password_hash)
-        VALUES ('admin', $1)
-        ON CONFLICT (username) DO NOTHING;
-        """, hashlib.sha256("admin123".encode()).hexdigest())
-
-
+        try:
+            # Создаем таблицы по очереди
+            tables = [
+                ("users", """
+                    CREATE TABLE IF NOT EXISTS users (
+                        id BIGSERIAL PRIMARY KEY,
+                        telegram_id BIGINT UNIQUE NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """),
+                ("meditations", """
+                    CREATE TABLE IF NOT EXISTS meditations (
+                        id BIGSERIAL PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        description TEXT,
+                        audio_url TEXT,
+                        duration_sec INT DEFAULT 0,
+                        is_free BOOLEAN DEFAULT FALSE,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """),
+                ("subscription_plans", """
+                    CREATE TABLE IF NOT EXISTS subscription_plans (
+                        id BIGSERIAL PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        price INT NOT NULL,
+                        duration_days INT NOT NULL,
+                        is_active BOOLEAN DEFAULT TRUE,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """),
+                ("subscriptions", """
+                    CREATE TABLE IF NOT EXISTS subscriptions (
+                        id BIGSERIAL PRIMARY KEY,
+                        user_id BIGINT REFERENCES users(id),
+                        plan_id BIGINT REFERENCES subscription_plans(id),
+                        expires_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """),
+                ("admin_users", """
+                    CREATE TABLE IF NOT EXISTS admin_users (
+                        id SERIAL PRIMARY KEY,
+                        username VARCHAR(50) UNIQUE NOT NULL,
+                        password_hash VARCHAR(255) NOT NULL,
+                        created_at TIMESTAMP DEFAULT NOW()
+                    )
+                """)
+            ]
+            
+            for table_name, sql in tables:
+                try:
+                    await conn.execute(sql)
+                    print(f"Table '{table_name}' checked/created")
+                except Exception as e:
+                    print(f"Error creating table '{table_name}': {e}")
+            
+            # Добавляем администратора по умолчанию
+            try:
+                password_hash = hashlib.sha256("admin123".encode()).hexdigest()
+                await conn.execute("""
+                    INSERT INTO admin_users (username, password_hash)
+                    VALUES ('admin', $1)
+                    ON CONFLICT (username) DO NOTHING
+                """, password_hash)
+                print("Default admin user checked/created")
+            except Exception as e:
+                print(f"Error creating admin user: {e}")
+                
+        except Exception as e:
+            print(f"Database initialization error: {e}")
+            raise
 # ================= AUTH UTILS =================
 
 def create_jwt(username: str) -> str:
