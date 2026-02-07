@@ -8,11 +8,11 @@ from typing import Optional
 from aiohttp import web
 import aiohttp_cors
 import uuid
-import io
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, PreCheckoutQuery, LabeledPrice, CommandObject
+from aiogram.types import Message, PreCheckoutQuery, LabeledPrice
 from aiogram.filters import CommandStart
+from aiogram.filters.command import CommandObject  # Правильный импорт для версии 3.3.0
 
 # Для работы с S3
 try:
