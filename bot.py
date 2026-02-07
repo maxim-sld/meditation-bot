@@ -7,13 +7,21 @@ from datetime import datetime, timedelta
 from typing import Optional
 from aiohttp import web
 import aiohttp_cors
-import aioboto3
-from botocore.exceptions import ClientError
 import uuid
+import io
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, PreCheckoutQuery, LabeledPrice, CommandObject
 from aiogram.filters import CommandStart
+
+# Для работы с S3
+try:
+    import aioboto3
+    from aiobotocore.config import AioConfig
+    S3_AVAILABLE = True
+except ImportError:
+    S3_AVAILABLE = False
+    print("Warning: aioboto3 not installed. S3 functionality will be disabled.")
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PAY_TOKEN = os.getenv("PAY_TOKEN")
@@ -36,6 +44,12 @@ db: asyncpg.Pool
 
 async def upload_to_s3(file_data: bytes, file_name: str, content_type: str = "audio/mpeg") -> str:
     """Загружает файл в Yandex Cloud S3 и возвращает публичный URL"""
+    if not S3_AVAILABLE:
+        raise RuntimeError("aioboto3 is not installed")
+    
+    if not all([S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+        raise RuntimeError("S3 credentials not configured")
+    
     try:
         session = aioboto3.Session()
         async with session.client(
@@ -43,7 +57,8 @@ async def upload_to_s3(file_data: bytes, file_name: str, content_type: str = "au
             endpoint_url=S3_ENDPOINT_URL,
             aws_access_key_id=S3_ACCESS_KEY_ID,
             aws_secret_access_key=S3_SECRET_ACCESS_KEY,
-            region_name=S3_REGION
+            region_name=S3_REGION,
+            config=AioConfig(signature_version='s3v4')
         ) as s3:
             # Генерируем уникальное имя файла
             unique_filename = f"{uuid.uuid4()}_{file_name}"
@@ -65,8 +80,14 @@ async def upload_to_s3(file_data: bytes, file_name: str, content_type: str = "au
 
 async def delete_from_s3(file_url: str):
     """Удаляет файл из S3"""
+    if not S3_AVAILABLE or not all([S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+        return
+    
     try:
         # Извлекаем имя файла из URL
+        if 'storage.yandexcloud.net' not in file_url:
+            return
+        
         file_name = file_url.split('/')[-1]
         
         session = aioboto3.Session()
@@ -75,7 +96,8 @@ async def delete_from_s3(file_url: str):
             endpoint_url=S3_ENDPOINT_URL,
             aws_access_key_id=S3_ACCESS_KEY_ID,
             aws_secret_access_key=S3_SECRET_ACCESS_KEY,
-            region_name=S3_REGION
+            region_name=S3_REGION,
+            config=AioConfig(signature_version='s3v4')
         ) as s3:
             await s3.delete_object(
                 Bucket=S3_BUCKET_NAME,
@@ -84,6 +106,23 @@ async def delete_from_s3(file_url: str):
     except Exception as e:
         print(f"Error deleting from S3: {e}")
         # Не падаем, если не удалось удалить файл
+
+# ================= Без S3 fallback =================
+
+async def handle_audio_upload(file_data: bytes, file_name: str, content_type: str) -> str:
+    """Обработка загрузки аудио (с S3 или без)"""
+    try:
+        # Пробуем загрузить в S3
+        if S3_AVAILABLE and S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY:
+            return await upload_to_s3(file_data, file_name, content_type)
+    except Exception as e:
+        print(f"S3 upload failed: {e}")
+    
+    # Fallback: сохраняем URL как есть (например, если файл уже загружен)
+    # Или можно использовать другой сервис
+    raise RuntimeError("S3 is not configured properly. Please check your S3 credentials.")
+
+# Остальной код остается таким же...
 
 # ================= DB INIT =================
 
