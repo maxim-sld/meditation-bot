@@ -390,6 +390,32 @@ async def successful_payment(message: Message):
         print(f"Error processing payment: {e}")
         await message.answer("Ошибка при активации подписки. Обратитесь в поддержку.")
 
+# ================= JSON UTILS =================
+
+import json
+from decimal import Decimal
+from datetime import date, datetime
+
+class CustomJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (datetime, date)):
+            return obj.isoformat()
+        if isinstance(obj, Decimal):
+            return float(obj)
+        return super().default(obj)
+
+def row_to_dict(row):
+    """Преобразует строку из БД в словарь с сериализуемыми типами"""
+    result = {}
+    for key, value in dict(row).items():
+        if isinstance(value, (datetime, date)):
+            result[key] = value.isoformat()
+        elif isinstance(value, Decimal):
+            result[key] = float(value)
+        else:
+            result[key] = value
+    return result
+
 # ================= PUBLIC API =================
 
 async def api_meditations(request):
@@ -491,7 +517,8 @@ async def api_admin_verify(request):
 async def api_admin_all_meditations(request):
     try:
         rows = await db.fetch("SELECT * FROM meditations ORDER BY id")
-        return web.json_response([dict(r) for r in rows])
+        data = [row_to_dict(r) for r in rows]
+        return web.json_response(data, dumps=lambda x: json.dumps(x, cls=CustomJSONEncoder))
     except Exception as e:
         print(f"Error in api_admin_all_meditations: {e}")
         return web.json_response({"error": "Internal server error"}, status=500)
@@ -598,12 +625,15 @@ async def api_admin_delete_meditation(request):
         print(f"Error in api_admin_delete_meditation: {e}")
         return web.json_response({"error": str(e)}, status=500)
 
+
 # ================= ADMIN PLANS =================
 
 async def api_admin_all_plans(request):
     try:
         rows = await db.fetch("SELECT * FROM subscription_plans ORDER BY id")
-        return web.json_response([dict(r) for r in rows])
+        # Используем нашу функцию для конвертации
+        data = [row_to_dict(r) for r in rows]
+        return web.json_response(data, dumps=lambda x: json.dumps(x, cls=CustomJSONEncoder))
     except Exception as e:
         print(f"Error in api_admin_all_plans: {e}")
         return web.json_response({"error": "Internal server error"}, status=500)
@@ -653,7 +683,8 @@ async def api_admin_subscriptions(request):
             WHERE s.expires_at > NOW()
             ORDER BY s.expires_at DESC
         """)
-        return web.json_response([dict(r) for r in rows])
+        data = [row_to_dict(r) for r in rows]
+        return web.json_response(data, dumps=lambda x: json.dumps(x, cls=CustomJSONEncoder))
     except Exception as e:
         print(f"Error in api_admin_subscriptions: {e}")
         return web.json_response({"error": "Internal server error"}, status=500)
