@@ -1,24 +1,89 @@
 import asyncio
 import os
 import asyncpg
+import jwt
+import hashlib
 from datetime import datetime, timedelta
-
+from typing import Optional
 from aiohttp import web
 import aiohttp_cors
+import aioboto3
+from botocore.exceptions import ClientError
+import uuid
 
 from aiogram import Bot, Dispatcher, F
-from aiogram.types import Message, PreCheckoutQuery, LabeledPrice
+from aiogram.types import Message, PreCheckoutQuery, LabeledPrice, CommandObject
 from aiogram.filters import CommandStart
-
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PAY_TOKEN = os.getenv("PAY_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change_me_in_production")
+JWT_SECRET = os.getenv("JWT_SECRET", "super_secret_jwt_key_change_me")
+
+# Yandex Cloud S3 конфигурация
+S3_ENDPOINT_URL = os.getenv("S3_ENDPOINT_URL", "https://storage.yandexcloud.net")
+S3_ACCESS_KEY_ID = os.getenv("S3_ACCESS_KEY_ID")
+S3_SECRET_ACCESS_KEY = os.getenv("S3_SECRET_ACCESS_KEY")
+S3_BUCKET_NAME = os.getenv("S3_BUCKET_NAME")
+S3_REGION = os.getenv("S3_REGION", "ru-central1")
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 db: asyncpg.Pool
 
+# ================= S3 UTILS =================
+
+async def upload_to_s3(file_data: bytes, file_name: str, content_type: str = "audio/mpeg") -> str:
+    """Загружает файл в Yandex Cloud S3 и возвращает публичный URL"""
+    try:
+        session = aioboto3.Session()
+        async with session.client(
+            service_name='s3',
+            endpoint_url=S3_ENDPOINT_URL,
+            aws_access_key_id=S3_ACCESS_KEY_ID,
+            aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+            region_name=S3_REGION
+        ) as s3:
+            # Генерируем уникальное имя файла
+            unique_filename = f"{uuid.uuid4()}_{file_name}"
+            
+            await s3.put_object(
+                Bucket=S3_BUCKET_NAME,
+                Key=unique_filename,
+                Body=file_data,
+                ContentType=content_type,
+                ACL='public-read'
+            )
+            
+            # Формируем публичный URL
+            public_url = f"{S3_ENDPOINT_URL}/{S3_BUCKET_NAME}/{unique_filename}"
+            return public_url
+    except Exception as e:
+        print(f"Error uploading to S3: {e}")
+        raise
+
+async def delete_from_s3(file_url: str):
+    """Удаляет файл из S3"""
+    try:
+        # Извлекаем имя файла из URL
+        file_name = file_url.split('/')[-1]
+        
+        session = aioboto3.Session()
+        async with session.client(
+            service_name='s3',
+            endpoint_url=S3_ENDPOINT_URL,
+            aws_access_key_id=S3_ACCESS_KEY_ID,
+            aws_secret_access_key=S3_SECRET_ACCESS_KEY,
+            region_name=S3_REGION
+        ) as s3:
+            await s3.delete_object(
+                Bucket=S3_BUCKET_NAME,
+                Key=file_name
+            )
+    except Exception as e:
+        print(f"Error deleting from S3: {e}")
+        # Не падаем, если не удалось удалить файл
 
 # ================= DB INIT =================
 
@@ -30,7 +95,8 @@ async def init_db():
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id BIGSERIAL PRIMARY KEY,
-            telegram_id BIGINT UNIQUE NOT NULL
+            telegram_id BIGINT UNIQUE NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
         );
 
         CREATE TABLE IF NOT EXISTS meditations (
@@ -38,8 +104,9 @@ async def init_db():
             title TEXT NOT NULL,
             description TEXT,
             audio_url TEXT,
-            duration_sec INT,
-            is_free BOOLEAN DEFAULT FALSE
+            duration_sec INT DEFAULT 0,
+            is_free BOOLEAN DEFAULT FALSE,
+            created_at TIMESTAMP DEFAULT NOW()
         );
 
         CREATE TABLE IF NOT EXISTS subscription_plans (
@@ -47,16 +114,69 @@ async def init_db():
             title TEXT NOT NULL,
             price INT NOT NULL,
             duration_days INT NOT NULL,
-            is_active BOOLEAN DEFAULT TRUE
+            is_active BOOLEAN DEFAULT TRUE,
+            created_at TIMESTAMP DEFAULT NOW()
         );
 
         CREATE TABLE IF NOT EXISTS subscriptions (
             id BIGSERIAL PRIMARY KEY,
             user_id BIGINT REFERENCES users(id),
             plan_id BIGINT REFERENCES subscription_plans(id),
-            expires_at TIMESTAMP
+            expires_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT NOW()
         );
-        """)
+
+        CREATE TABLE IF NOT EXISTS admin_users (
+            id SERIAL PRIMARY KEY,
+            username VARCHAR(50) UNIQUE NOT NULL,
+            password_hash VARCHAR(255) NOT NULL,
+            created_at TIMESTAMP DEFAULT NOW()
+        );
+
+        INSERT INTO admin_users (username, password_hash)
+        VALUES ('admin', $1)
+        ON CONFLICT (username) DO NOTHING;
+        """, hashlib.sha256("admin123".encode()).hexdigest())
+
+
+# ================= AUTH UTILS =================
+
+def create_jwt(username: str) -> str:
+    payload = {
+        "sub": username,
+        "exp": datetime.utcnow() + timedelta(hours=24),
+        "iat": datetime.utcnow()
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+def verify_jwt(token: str) -> Optional[dict]:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        return payload
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+@web.middleware
+async def auth_middleware(request: web.Request, handler):
+    # Пропускаем публичные эндпоинты
+    public_paths = ['/meditations', '/access', '/plans', '/admin/login', '/health']
+    if any(request.path.startswith(path) for path in public_paths):
+        return await handler(request)
+    
+    # Проверяем токен для админских путей
+    if request.path.startswith('/admin'):
+        auth_header = request.headers.get('Authorization')
+        if not auth_header or not auth_header.startswith('Bearer '):
+            return web.json_response({'error': 'Unauthorized'}, status=401)
+        
+        token = auth_header.split(' ')[1]
+        payload = verify_jwt(token)
+        if not payload:
+            return web.json_response({'error': 'Invalid token'}, status=401)
+    
+    return await handler(request)
 
 
 # ================= USERS =================
@@ -80,7 +200,6 @@ async def get_or_create_user(telegram_id: int) -> int:
 
 async def give_subscription(user_id: int, plan_id: int):
     async with db.acquire() as conn:
-
         plan = await conn.fetchrow(
             "SELECT duration_days FROM subscription_plans WHERE id=$1",
             plan_id,
@@ -111,22 +230,55 @@ async def has_active_subscription(user_id: int) -> bool:
 # ================= BOT =================
 
 @dp.message(CommandStart())
-async def start(message: Message):
+async def start(message: Message, command: CommandObject = None):
     await get_or_create_user(message.from_user.id)
+    
+    # Обработка deep link для покупки
+    if command and command.args and command.args.startswith("buy_"):
+        try:
+            plan_id = int(command.args.split("_")[1])
+            
+            async with db.acquire() as conn:
+                plan = await conn.fetchrow(
+                    "SELECT title, price FROM subscription_plans WHERE id=$1 AND is_active=TRUE",
+                    plan_id,
+                )
+            
+            if plan:
+                await bot.send_invoice(
+                    chat_id=message.from_user.id,
+                    title=plan["title"],
+                    description="Подписка на медитации",
+                    payload=f"plan_{plan_id}",
+                    provider_token=PAY_TOKEN,
+                    currency="RUB",
+                    prices=[LabeledPrice(label=plan["title"], amount=plan["price"])],
+                )
+                return
+        
+        except (ValueError, IndexError):
+            pass
+    
     await message.answer("Открой Mini App и выбери медитацию ✨")
 
 
-# ---------- BUY ----------
-
 @dp.message(F.text.startswith("💳 Купить"))
 async def buy_plan(message: Message):
-    plan_id = int(message.text.split("#")[1])
+    try:
+        plan_id = int(message.text.split("#")[1])
+    except (IndexError, ValueError):
+        await message.answer("Ошибка: неверный формат команды")
+        return
 
     async with db.acquire() as conn:
         plan = await conn.fetchrow(
-            "SELECT title, price FROM subscription_plans WHERE id=$1",
+            "SELECT title, price FROM subscription_plans WHERE id=$1 AND is_active=TRUE",
             plan_id,
         )
+
+    if not plan:
+        await message.answer("Тариф не найден")
+        return
 
     await bot.send_invoice(
         chat_id=message.from_user.id,
@@ -159,91 +311,320 @@ async def successful_payment(message: Message):
 # ================= PUBLIC API =================
 
 async def api_meditations(request):
-    rows = await db.fetch(
-        "SELECT id, title, description, audio_url, duration_sec, is_free FROM meditations"
-    )
-    return web.json_response([dict(r) for r in rows])
+    try:
+        rows = await db.fetch(
+            "SELECT id, title, description, audio_url, duration_sec, is_free FROM meditations ORDER BY created_at DESC"
+        )
+        return web.json_response([dict(r) for r in rows])
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 
 async def api_access(request):
-    telegram_id = int(request.query["user_id"])
-    meditation_id = int(request.query["meditation_id"])
+    try:
+        telegram_id = request.query.get("user_id")
+        meditation_id = request.query.get("meditation_id")
+        
+        if not telegram_id or not meditation_id:
+            return web.json_response({"error": "Missing parameters"}, status=400)
+        
+        telegram_id = int(telegram_id)
+        meditation_id = int(meditation_id)
+    except ValueError:
+        return web.json_response({"error": "Invalid parameters"}, status=400)
+    
+    try:
+        user_id = await get_or_create_user(telegram_id)
 
-    user_id = await get_or_create_user(telegram_id)
+        async with db.acquire() as conn:
+            free = await conn.fetchval(
+                "SELECT is_free FROM meditations WHERE id=$1",
+                meditation_id,
+            )
 
-    async with db.acquire() as conn:
-        free = await conn.fetchval(
-            "SELECT is_free FROM meditations WHERE id=$1",
-            meditation_id,
-        )
+        if free:
+            return web.json_response({"access": True})
 
-    if free:
-        return web.json_response({"access": True})
-
-    return web.json_response({"access": await has_active_subscription(user_id)})
+        return web.json_response({"access": await has_active_subscription(user_id)})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 
 async def api_plans(request):
-    rows = await db.fetch(
-        "SELECT id, title, price, duration_days FROM subscription_plans WHERE is_active=TRUE"
-    )
-    return web.json_response([dict(r) for r in rows])
+    try:
+        rows = await db.fetch(
+            "SELECT id, title, price, duration_days FROM subscription_plans WHERE is_active=TRUE ORDER BY price"
+        )
+        return web.json_response([dict(r) for r in rows])
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 
-# ================= ADMIN =================
+# ================= ADMIN AUTH =================
+
+async def api_admin_login(request):
+    try:
+        data = await request.json()
+        username = data.get("username")
+        password = data.get("password")
+        
+        if not username or not password:
+            return web.json_response({"error": "Missing credentials"}, status=400)
+        
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        
+        async with db.acquire() as conn:
+            user = await conn.fetchrow(
+                "SELECT id, username FROM admin_users WHERE username=$1 AND password_hash=$2",
+                username, password_hash
+            )
+        
+        if not user:
+            return web.json_response({"error": "Invalid credentials"}, status=401)
+        
+        token = create_jwt(username)
+        return web.json_response({
+            "token": token,
+            "user": {"id": user["id"], "username": user["username"]}
+        })
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_admin_verify(request):
+    auth_header = request.headers.get('Authorization')
+    if not auth_header or not auth_header.startswith('Bearer '):
+        return web.json_response({'error': 'No token'}, status=401)
+    
+    token = auth_header.split(' ')[1]
+    payload = verify_jwt(token)
+    
+    if not payload:
+        return web.json_response({'error': 'Invalid token'}, status=401)
+    
+    return web.json_response({"valid": True, "username": payload["sub"]})
+
+
+# ================= ADMIN MEDITATIONS =================
+
+async def api_admin_all_meditations(request):
+    try:
+        rows = await db.fetch("SELECT * FROM meditations ORDER BY id")
+        return web.json_response([dict(r) for r in rows])
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_admin_create_meditation(request):
+    try:
+        reader = await request.multipart()
+        
+        fields = {}
+        file_data = None
+        file_name = None
+        content_type = None
+        
+        async for part in reader:
+            if part.name == 'file':
+                file_name = part.filename
+                if not file_name or not file_name.endswith('.mp3'):
+                    return web.json_response({"error": "Only MP3 files allowed"}, status=400)
+                
+                content_type = part.headers.get('Content-Type', 'audio/mpeg')
+                file_data = await part.read()
+                
+                if len(file_data) > 50 * 1024 * 1024:  # 50MB limit
+                    return web.json_response({"error": "File too large (max 50MB)"}, status=400)
+                
+            else:
+                fields[part.name] = await part.text()
+        
+        if not file_data:
+            return web.json_response({"error": "No file provided"}, status=400)
+        
+        # Загружаем файл в S3
+        audio_url = await upload_to_s3(file_data, file_name, content_type)
+        
+        # Преобразуем типы
+        is_free = fields.get('is_free', '').lower() == 'true'
+        
+        async with db.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO meditations (title, description, audio_url, is_free)
+                VALUES ($1, $2, $3, $4)
+                """,
+                fields.get('title', '').strip(),
+                fields.get('description', '').strip(),
+                audio_url,
+                is_free
+            )
+        
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_admin_update_meditation(request):
+    try:
+        meditation_id = int(request.match_info['id'])
+        data = await request.json()
+        
+        async with db.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE meditations 
+                SET title=$1, description=$2, is_free=$3
+                WHERE id=$4
+                """,
+                data.get('title', '').strip(),
+                data.get('description', '').strip(),
+                data.get('is_free', False),
+                meditation_id
+            )
+        
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+async def api_admin_delete_meditation(request):
+    try:
+        meditation_id = int(request.match_info['id'])
+        
+        async with db.acquire() as conn:
+            # Получаем URL аудио для удаления файла из S3
+            audio_url = await conn.fetchval(
+                "SELECT audio_url FROM meditations WHERE id=$1",
+                meditation_id
+            )
+            
+            # Удаляем запись из БД
+            await conn.execute(
+                "DELETE FROM meditations WHERE id=$1",
+                meditation_id
+            )
+        
+        # Удаляем файл из S3, если он существует
+        if audio_url and 'storage.yandexcloud.net' in audio_url:
+            await delete_from_s3(audio_url)
+        
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+# ================= ADMIN PLANS =================
 
 async def api_admin_all_plans(request):
-    rows = await db.fetch("SELECT * FROM subscription_plans ORDER BY id")
-    return web.json_response([dict(r) for r in rows])
+    try:
+        rows = await db.fetch("SELECT * FROM subscription_plans ORDER BY id")
+        return web.json_response([dict(r) for r in rows])
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 
 async def api_admin_create_plan(request):
-    data = await request.json()
+    try:
+        data = await request.json()
+        
+        await db.execute(
+            "INSERT INTO subscription_plans (title, price, duration_days) VALUES ($1,$2,$3)",
+            data["title"],
+            int(data["price"]),
+            int(data["duration_days"]),
+        )
 
-    await db.execute(
-        "INSERT INTO subscription_plans (title, price, duration_days) VALUES ($1,$2,$3)",
-        data["title"],
-        int(data["price"]),
-        int(data["duration_days"]),
-    )
-
-    return web.json_response({"ok": True})
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
 
 
 async def api_admin_toggle_plan(request):
-    plan_id = int(request.match_info["id"])
+    try:
+        plan_id = int(request.match_info["id"])
 
-    await db.execute(
-        "UPDATE subscription_plans SET is_active = NOT is_active WHERE id=$1",
-        plan_id,
-    )
+        await db.execute(
+            "UPDATE subscription_plans SET is_active = NOT is_active WHERE id=$1",
+            plan_id,
+        )
 
-    return web.json_response({"ok": True})
+        return web.json_response({"ok": True})
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+# ================= ADMIN SUBSCRIPTIONS =================
+
+async def api_admin_subscriptions(request):
+    try:
+        rows = await db.fetch("""
+            SELECT s.*, u.telegram_id, p.title as plan_title
+            FROM subscriptions s
+            JOIN users u ON s.user_id = u.id
+            JOIN subscription_plans p ON s.plan_id = p.id
+            WHERE s.expires_at > NOW()
+            ORDER BY s.expires_at DESC
+        """)
+        return web.json_response([dict(r) for r in rows])
+    except Exception as e:
+        return web.json_response({"error": str(e)}, status=500)
+
+
+# ================= HEALTH CHECK =================
+
+async def api_health(request):
+    return web.json_response({
+        "status": "ok", 
+        "timestamp": datetime.utcnow().isoformat(),
+        "services": {
+            "database": "connected" if db else "disconnected",
+            "s3": "configured" if S3_ACCESS_KEY_ID else "not_configured"
+        }
+    })
 
 
 # ================= WEB =================
 
 async def start_web():
-    app = web.Application()
-
+    app = web.Application(middlewares=[auth_middleware])
+    
+    # Настройка CORS - разрешаем запросы с Vercel и локальной разработки
     cors = aiohttp_cors.setup(
         app,
-        defaults={"*": aiohttp_cors.ResourceOptions(
-            allow_credentials=True,
-            expose_headers="*",
-            allow_headers="*",
-            allow_methods="*",
-        )},
+        defaults={
+            "*": aiohttp_cors.ResourceOptions(
+                allow_credentials=True,
+                expose_headers="*",
+                allow_headers="*",
+                allow_methods="*",
+            )
+        },
     )
 
+    # Публичные эндпоинты
     app.router.add_get("/meditations", api_meditations)
     app.router.add_get("/access", api_access)
     app.router.add_get("/plans", api_plans)
-
+    app.router.add_get("/health", api_health)
+    
+    # Аутентификация
+    app.router.add_post("/admin/login", api_admin_login)
+    app.router.add_get("/admin/verify", api_admin_verify)
+    
+    # Админские эндпоинты (требуют JWT)
+    app.router.add_get("/admin/meditations", api_admin_all_meditations)
+    app.router.add_post("/admin/meditation", api_admin_create_meditation)
+    app.router.add_put("/admin/meditation/{id}", api_admin_update_meditation)
+    app.router.add_delete("/admin/meditation/{id}", api_admin_delete_meditation)
+    
     app.router.add_get("/admin/plans", api_admin_all_plans)
     app.router.add_post("/admin/plans", api_admin_create_plan)
     app.router.add_post("/admin/plans/{id}/toggle", api_admin_toggle_plan)
+    
+    app.router.add_get("/admin/subscriptions", api_admin_subscriptions)
 
+    # Применяем CORS ко всем роутам
     for route in list(app.router.routes()):
         cors.add(route)
 
