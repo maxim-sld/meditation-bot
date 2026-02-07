@@ -210,9 +210,12 @@ def verify_jwt(token: str) -> Optional[dict]:
         return None
     except jwt.InvalidTokenError:
         return None
-
 @web.middleware
 async def auth_middleware(request: web.Request, handler):
+    # Разрешаем OPTIONS запросы без проверки токена (для CORS preflight)
+    if request.method == "OPTIONS":
+        return await handler(request)
+    
     # Пропускаем публичные эндпоинты
     public_paths = ['/meditations', '/access', '/plans', '/admin/login', '/health']
     if any(request.path.startswith(path) for path in public_paths):
@@ -657,7 +660,7 @@ async def start_web():
                 allow_credentials=True,
                 expose_headers="*",
                 allow_headers="*",
-                allow_methods="*",
+                allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
             )
         },
     )
@@ -684,9 +687,28 @@ async def start_web():
     
     app.router.add_get("/admin/subscriptions", api_admin_subscriptions)
 
-    # Применяем CORS ко всем роутам
+    # Явно добавляем OPTIONS для всех путей
     for route in list(app.router.routes()):
         cors.add(route)
+    
+    # Добавляем обработчик OPTIONS для всех путей
+    async def options_handler(request):
+        return web.Response(
+            status=200,
+            headers={
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers': 'Authorization, Content-Type',
+                'Access-Control-Allow-Credentials': 'true',
+            }
+        )
+    
+    # Регистрируем OPTIONS для всех путей
+    for resource in app.router.resources():
+        # Получаем путь ресурса
+        path = resource.canonical
+        # Добавляем OPTIONS метод
+        app.router.add_route('OPTIONS', path, options_handler)
 
     port = int(os.environ.get("PORT", 8080))
     
