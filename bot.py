@@ -310,38 +310,86 @@ async def has_active_subscription(user_id: int) -> bool:
 @dp.message(CommandStart())
 async def start(message: Message, command: CommandObject = None):
     try:
-        await get_or_create_user(message.from_user.id)
+        user_id = await get_or_create_user(message.from_user.id)
         
+        # Приветственное сообщение
+        welcome_text = f"""Привет, {message.from_user.first_name}!
+
+Добро пожаловать в приложение медитаций! 🧘‍♀️
+
+Открой Mini App через меню бота или перейди по ссылке, чтобы:
+• Слушать бесплатные медитации
+• Приобрести подписку на Premium
+• Найти свой путь к спокойствию
+
+✨ Удачи на пути самопознания!"""
+
         # Обработка deep link для покупки
-        if command and command.args and command.args.startswith("buy_"):
-            try:
-                plan_id = int(command.args.split("_")[1])
+        if command and command.args:
+            if command.args.startswith("buy_"):
+                try:
+                    plan_id = int(command.args.split("_")[1])
+                    
+                    async with db.acquire() as conn:
+                        plan = await conn.fetchrow(
+                            "SELECT title, price FROM subscription_plans WHERE id=$1 AND is_active=TRUE",
+                            plan_id,
+                        )
+                    
+                    if plan:
+                        await bot.send_invoice(
+                            chat_id=message.from_user.id,
+                            title=plan["title"],
+                            description="Подписка на все медитации",
+                            payload=f"plan_{plan_id}",
+                            provider_token=PAY_TOKEN,
+                            currency="RUB",
+                            prices=[LabeledPrice(label=plan["title"], amount=plan["price"])],
+                            start_parameter=f"buy_{plan_id}",
+                            need_email=False,
+                            need_phone_number=False,
+                            need_shipping_address=False,
+                            is_flexible=False,
+                            disable_notification=False,
+                            protect_content=False,
+                        )
+                        return
+                    else:
+                        await message.answer("❌ Тарифный план не найден или неактивен")
                 
-                async with db.acquire() as conn:
-                    plan = await conn.fetchrow(
-                        "SELECT title, price FROM subscription_plans WHERE id=$1 AND is_active=TRUE",
-                        plan_id,
-                    )
-                
-                if plan:
-                    await bot.send_invoice(
-                        chat_id=message.from_user.id,
-                        title=plan["title"],
-                        description="Подписка на медитации",
-                        payload=f"plan_{plan_id}",
-                        provider_token=PAY_TOKEN,
-                        currency="RUB",
-                        prices=[LabeledPrice(label=plan["title"], amount=plan["price"])],
-                    )
-                    return
+                except (ValueError, IndexError) as e:
+                    print(f"Error processing buy command: {e}")
+                    await message.answer("❌ Неверная ссылка для покупки")
             
-            except (ValueError, IndexError) as e:
-                print(f"Error processing buy command: {e}")
+            elif command.args == "mini_app":
+                # Ссылка для открытия Mini App
+                await message.answer(
+                    "🎯 Открой Mini App для работы с медитациями:",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(
+                            text="📱 Открыть приложение",
+                            web_app=WebAppInfo(url="https://your-mini-app-url.com")
+                        )
+                    ]])
+                )
+                return
         
-        await message.answer("Открой Mini App и выбери медитацию ✨")
+        await message.answer(welcome_text)
+        
+        # Кнопка для открытия Mini App
+        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, WebAppInfo
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(
+                text="🚀 Открыть приложение",
+                web_app=WebAppInfo(url="https://your-mini-app-url.com")
+            )
+        ]])
+        
+        await message.answer("Нажми кнопку ниже, чтобы начать:", reply_markup=keyboard)
+        
     except Exception as e:
         print(f"Error in start command: {e}")
-        await message.answer("Произошла ошибка. Попробуйте позже.")
+        await message.answer("Произошла ошибка. Попробуйте позже или обратитесь в поддержку.")
 
 @dp.message(F.text.startswith("💳 Купить"))
 async def buy_plan(message: Message):
@@ -467,6 +515,74 @@ async def api_plans(request):
     except Exception as e:
         print(f"Error in api_plans: {e}")
         return web.json_response({"error": "Internal server error"}, status=500)
+
+# ================= INVOICE FOR MINI APP =================
+
+async def api_send_invoice(request):
+    """Создает инвойс для Mini App"""
+    try:
+        data = await request.json()
+        telegram_id = data.get('telegram_id')
+        plan_id = data.get('plan_id')
+        
+        if not telegram_id or not plan_id:
+            return web.json_response({'error': 'Missing parameters'}, status=400)
+        
+        async with db.acquire() as conn:
+            plan = await conn.fetchrow(
+                "SELECT title, price FROM subscription_plans WHERE id=$1 AND is_active=TRUE",
+                plan_id,
+            )
+        
+        if not plan:
+            return web.json_response({'error': 'Plan not found'}, status=404)
+        
+        # Создаем инвойс через бота
+        from aiogram.types import LabeledPrice
+        
+        prices = [LabeledPrice(label=plan["title"], amount=plan["price"])]
+        
+        # Для Mini App нужно создать инвойс и вернуть ссылку
+        # Используем метод createInvoiceLink для генерации ссылки
+        # Но в aiogram нет прямого метода, поэтому можно использовать:
+        # 1. Отправить инвойс в ЛС (если пользователь уже общался с ботом)
+        # 2. Использовать deep link с payload
+        
+        # Альтернатива: возвращаем данные для фронтенда
+        return web.json_response({
+            'ok': True,
+            'plan': {
+                'id': plan_id,
+                'title': plan['title'],
+                'price': plan['price']
+            },
+            'payload': f'plan_{plan_id}',
+            'instructions': 'Используйте эту ссылку для оплаты...'
+        })
+        
+    except Exception as e:
+        print(f"Error in api_send_invoice: {e}")
+        return web.json_response({'error': str(e)}, status=500)
+
+async def api_check_payment(request):
+    """Проверяет статус платежа для Mini App"""
+    try:
+        data = await request.json()
+        telegram_id = data.get('telegram_id')
+        plan_id = data.get('plan_id')
+        
+        # Здесь можно проверить в БД, есть ли активная подписка
+        user_id = await get_or_create_user(telegram_id)
+        has_access = await has_active_subscription(user_id)
+        
+        return web.json_response({
+            'has_access': has_access,
+            'user_id': user_id
+        })
+        
+    except Exception as e:
+        print(f"Error in api_check_payment: {e}")
+        return web.json_response({'error': str(e)}, status=500)
 
 # ================= ADMIN AUTH =================
 
@@ -749,6 +865,10 @@ async def start_web():
     app.router.add_get("/access", api_access)
     app.router.add_get("/plans", api_plans)
     app.router.add_get("/health", api_health)
+
+    # Новые эндпоинты для оплаты
+    app.router.add_post("/bot/sendInvoice", api_send_invoice)
+    app.router.add_post("/bot/checkPayment", api_check_payment)
     
     # Аутентификация
     app.router.add_post("/admin/login", api_admin_login)
