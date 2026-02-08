@@ -149,6 +149,20 @@ async def init_db():
                         created_at TIMESTAMP DEFAULT NOW()
                     )
                 """),
+		("payments", """
+  		    CREATE TABLE IF NOT EXISTS payments (
+       			id BIGSERIAL PRIMARY KEY,
+        		user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+        		telegram_payment_charge_id TEXT UNIQUE NOT NULL,
+        		provider_payment_charge_id TEXT,
+       			plan_id BIGINT REFERENCES subscription_plans(id),
+        		amount INT NOT NULL,
+        		currency VARCHAR(10) NOT NULL,
+        		status VARCHAR(20) DEFAULT 'paid',
+        		created_at TIMESTAMP DEFAULT NOW()
+ 		   )
+		"""),
+
                 ("subscriptions", """
                     CREATE TABLE IF NOT EXISTS subscriptions (
                         id BIGSERIAL PRIMARY KEY,
@@ -427,15 +441,42 @@ async def successful_payment(message: Message):
     try:
         user_id = await get_or_create_user(message.from_user.id)
 
-        payload = message.successful_payment.invoice_payload
+        payment = message.successful_payment
+        payload = payment.invoice_payload
         plan_id = int(payload.split("_")[1])
 
+        # --- сохраняем платёж ---
+        await db.execute(
+            """
+            INSERT INTO payments (
+                user_id,
+                telegram_payment_charge_id,
+                provider_payment_charge_id,
+                plan_id,
+                amount,
+                currency,
+                status
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,'paid')
+            ON CONFLICT (telegram_payment_charge_id) DO NOTHING
+            """,
+            user_id,
+            payment.telegram_payment_charge_id,
+            payment.provider_payment_charge_id,
+            plan_id,
+            payment.total_amount,
+            payment.currency,
+        )
+
+        # --- выдаём подписку ---
         await give_subscription(user_id, plan_id)
 
         await message.answer("Подписка активирована 🎉")
+
     except Exception as e:
         print(f"Error processing payment: {e}")
         await message.answer("Ошибка при активации подписки. Обратитесь в поддержку.")
+
 
 # ================= JSON UTILS =================
 
@@ -523,12 +564,27 @@ async def api_send_invoice(request):
     telegram_id = data["telegram_id"]
     plan_id = data["plan_id"]
 
+    # получаем user_id
+    user_id = await get_or_create_user(telegram_id)
+
+    # 🔒 защита от повторной покупки
+    if await has_active_subscription(user_id):
+        return web.json_response(
+            {"error": "subscription_active"},
+            status=400
+        )
+
+    # получаем план
     async with db.acquire() as conn:
         plan = await conn.fetchrow(
-            "SELECT title, price FROM subscription_plans WHERE id=$1",
+            "SELECT title, price FROM subscription_plans WHERE id=$1 AND is_active=TRUE",
             plan_id
         )
 
+    if not plan:
+        return web.json_response({"error": "plan_not_found"}, status=404)
+
+    # создаём invoice link
     link = await bot.create_invoice_link(
         title=plan["title"],
         description="Подписка",
