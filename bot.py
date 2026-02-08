@@ -6,7 +6,6 @@ import hashlib
 from datetime import datetime, timedelta
 from typing import Optional
 from aiohttp import web
-import aiohttp_cors
 import uuid
 
 from aiogram import Bot, Dispatcher, F
@@ -368,7 +367,7 @@ async def start(message: Message, command: CommandObject = None):
                     reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(
                             text="📱 Открыть приложение",
-                            web_app=WebAppInfo(url="https://your-mini-app-url.com")
+                            web_app=WebAppInfo(url="https://my-meditations-app.vercel.app")
                         )
                     ]])
                 )
@@ -381,7 +380,7 @@ async def start(message: Message, command: CommandObject = None):
         keyboard = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(
                 text="🚀 Открыть приложение",
-                web_app=WebAppInfo(url="https://your-mini-app-url.com")
+                web_app=WebAppInfo(url="https://my-meditations-app.vercel.app")
             )
         ]])
         
@@ -830,10 +829,6 @@ async def api_health(request):
 
 # ================= WEB =================
 
-# УДАЛИТЕ импорт aiohttp_cors:
-# import aiohttp_cors  # <-- УДАЛИТЬ эту строку
-
-# ... остальной код остается ...
 
 async def start_web():
     app = web.Application(middlewares=[auth_middleware])
