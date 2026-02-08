@@ -518,7 +518,6 @@ async def api_plans(request):
 
 # ================= INVOICE FOR MINI APP =================
 
-from aiogram.methods import CreateInvoiceLink
 
 async def api_send_invoice(request):
     data = await request.json()
@@ -542,52 +541,6 @@ async def api_send_invoice(request):
 
     return web.json_response({"invoice_link": link})
 
-
-async def api_send_invoice(request):
-    """Создает инвойс для Mini App"""
-    try:
-        data = await request.json()
-        telegram_id = data.get('telegram_id')
-        plan_id = data.get('plan_id')
-        
-        if not telegram_id or not plan_id:
-            return web.json_response({'error': 'Missing parameters'}, status=400)
-        
-        async with db.acquire() as conn:
-            plan = await conn.fetchrow(
-                "SELECT title, price FROM subscription_plans WHERE id=$1 AND is_active=TRUE",
-                plan_id,
-            )
-        
-        if not plan:
-            return web.json_response({'error': 'Plan not found'}, status=404)
-        
-        # Создаем инвойс через бота
-        from aiogram.types import LabeledPrice
-        
-        prices = [LabeledPrice(label=plan["title"], amount=plan["price"])]
-        
-        # Для Mini App нужно создать инвойс и вернуть ссылку
-        # Используем метод createInvoiceLink для генерации ссылки
-        # Но в aiogram нет прямого метода, поэтому можно использовать:
-        # 1. Отправить инвойс в ЛС (если пользователь уже общался с ботом)
-        # 2. Использовать deep link с payload
-        
-        # Альтернатива: возвращаем данные для фронтенда
-        return web.json_response({
-            'ok': True,
-            'plan': {
-                'id': plan_id,
-                'title': plan['title'],
-                'price': plan['price']
-            },
-            'payload': f'plan_{plan_id}',
-            'instructions': 'Используйте эту ссылку для оплаты...'
-        })
-        
-    except Exception as e:
-        print(f"Error in api_send_invoice: {e}")
-        return web.json_response({'error': str(e)}, status=500)
 
 async def api_check_payment(request):
     """Проверяет статус платежа для Mini App"""
@@ -894,8 +847,7 @@ async def start_web():
     # Новые эндпоинты для оплаты
     app.router.add_post("/bot/sendInvoice", api_send_invoice)
     app.router.add_post("/bot/checkPayment", api_check_payment)
-    app.router.add_post("/bot/sendInvoice", api_send_invoice)
-    
+  
 
     # Аутентификация
     app.router.add_post("/admin/login", api_admin_login)
