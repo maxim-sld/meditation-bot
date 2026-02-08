@@ -238,7 +238,7 @@ async def auth_middleware(request: web.Request, handler):
         )
     
     # Пропускаем публичные эндпоинты
-    public_paths = ['/meditations', '/access', '/plans', '/admin/login', '/health']
+    public_paths = ['/meditations', '/access', '/plans', '/subscription-status', '/admin/login', '/health']
     if any(request.path.startswith(path) for path in public_paths):
         response = await handler(request)
         # Добавляем CORS заголовки
