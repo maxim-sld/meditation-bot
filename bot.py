@@ -847,6 +847,25 @@ async def api_admin_toggle_plan(request):
         return web.json_response({"error": str(e)}, status=500)
 
 # ================= ADMIN SUBSCRIPTIONS =================
+async def api_subscription_status(request):
+    try:
+        telegram_id = request.query.get("user_id")
+        if not telegram_id:
+            return web.json_response({"error": "Missing user_id"}, status=400)
+
+        user_id = await get_or_create_user(int(telegram_id))
+        active = await has_active_subscription(user_id)
+
+        return web.json_response({
+            "active": active
+        })
+    except Exception as e:
+        print("subscription-status error:", e)
+        return web.json_response({"error": "server"}, status=500)
+
+
+# ================= ADMIN SUBSCRIPTIONS =================
+
 
 async def api_admin_subscriptions(request):
     try:
@@ -898,7 +917,9 @@ async def start_web():
     # Новые эндпоинты для оплаты
     app.router.add_post("/bot/sendInvoice", api_send_invoice)
     app.router.add_post("/bot/checkPayment", api_check_payment)
-  
+    # проверка подписки.
+    app.router.add_get("/subscription-status", api_subscription_status)
+
 
     # Аутентификация
     app.router.add_post("/admin/login", api_admin_login)
