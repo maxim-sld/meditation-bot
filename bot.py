@@ -559,16 +559,23 @@ async def api_admin_create_meditation(request):
         # Преобразуем типы
         is_free = fields.get('is_free', '').lower() == 'true'
         
+        # Получаем длительность (если передана)
+        try:
+            duration = int(fields.get('duration', 0))
+        except (ValueError, TypeError):
+            duration = 0
+        
         async with db.acquire() as conn:
             await conn.execute(
                 """
-                INSERT INTO meditations (title, description, audio_url, is_free)
-                VALUES ($1, $2, $3, $4)
+                INSERT INTO meditations (title, description, audio_url, is_free, duration_sec)
+                VALUES ($1, $2, $3, $4, $5)
                 """,
                 fields.get('title', '').strip(),
                 fields.get('description', '').strip(),
                 audio_url,
-                is_free
+                is_free,
+                duration  # Добавляем длительность
             )
         
         return web.json_response({"ok": True})
@@ -581,18 +588,37 @@ async def api_admin_update_meditation(request):
         meditation_id = int(request.match_info['id'])
         data = await request.json()
         
+        # Получаем длительность из запроса (если есть)
+        duration_sec = data.get('duration_sec', None)
+        
         async with db.acquire() as conn:
-            await conn.execute(
-                """
-                UPDATE meditations 
-                SET title=$1, description=$2, is_free=$3
-                WHERE id=$4
-                """,
-                data.get('title', '').strip(),
-                data.get('description', '').strip(),
-                data.get('is_free', False),
-                meditation_id
-            )
+            if duration_sec is not None:
+                # Если передана длительность - обновляем её тоже
+                await conn.execute(
+                    """
+                    UPDATE meditations 
+                    SET title=$1, description=$2, is_free=$3, duration_sec=$4
+                    WHERE id=$5
+                    """,
+                    data.get('title', '').strip(),
+                    data.get('description', '').strip(),
+                    data.get('is_free', False),
+                    int(duration_sec),
+                    meditation_id
+                )
+            else:
+                # Если длительность не передана - обновляем только основные поля
+                await conn.execute(
+                    """
+                    UPDATE meditations 
+                    SET title=$1, description=$2, is_free=$3
+                    WHERE id=$4
+                    """,
+                    data.get('title', '').strip(),
+                    data.get('description', '').strip(),
+                    data.get('is_free', False),
+                    meditation_id
+                )
         
         return web.json_response({"ok": True})
     except Exception as e:
