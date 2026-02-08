@@ -518,6 +518,31 @@ async def api_plans(request):
 
 # ================= INVOICE FOR MINI APP =================
 
+from aiogram.methods import CreateInvoiceLink
+
+async def api_send_invoice(request):
+    data = await request.json()
+    telegram_id = data["telegram_id"]
+    plan_id = data["plan_id"]
+
+    async with db.acquire() as conn:
+        plan = await conn.fetchrow(
+            "SELECT title, price FROM subscription_plans WHERE id=$1",
+            plan_id
+        )
+
+    link = await bot.create_invoice_link(
+        title=plan["title"],
+        description="Подписка",
+        payload=f"plan_{plan_id}",
+        provider_token=PAY_TOKEN,
+        currency="RUB",
+        prices=[LabeledPrice(label=plan["title"], amount=plan["price"])],
+    )
+
+    return web.json_response({"invoice_link": link})
+
+
 async def api_send_invoice(request):
     """Создает инвойс для Mini App"""
     try:
@@ -869,7 +894,9 @@ async def start_web():
     # Новые эндпоинты для оплаты
     app.router.add_post("/bot/sendInvoice", api_send_invoice)
     app.router.add_post("/bot/checkPayment", api_check_payment)
+    app.router.add_post("/bot/sendInvoice", api_send_invoice)
     
+
     # Аутентификация
     app.router.add_post("/admin/login", api_admin_login)
     app.router.add_get("/admin/verify", api_admin_verify)
