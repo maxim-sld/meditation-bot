@@ -702,11 +702,18 @@ async def api_admin_toggle_plan(request):
 async def api_admin_subscriptions(request):
     try:
         rows = await db.fetch("""
-            SELECT s.*, u.telegram_id, p.title as plan_title
+            SELECT 
+                s.*, 
+                u.telegram_id, 
+                p.title as plan_title,
+                p.price as plan_price,
+                CASE 
+                    WHEN s.expires_at > NOW() THEN true 
+                    ELSE false 
+                END as is_active
             FROM subscriptions s
             JOIN users u ON s.user_id = u.id
             JOIN subscription_plans p ON s.plan_id = p.id
-            WHERE s.expires_at > NOW()
             ORDER BY s.expires_at DESC
         """)
         data = [row_to_dict(r) for r in rows]
